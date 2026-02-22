@@ -5,6 +5,3 @@ numpy>=2.0.0
 pandas>=2.2.2
 protobuf>=6.31.1
 python-dotenv>=1.0.1
-
-# Numba ne supporte pas encore Python 3.13; installez-le avec Python 3.12.
-# numba==0.60.0
