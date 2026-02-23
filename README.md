@@ -90,3 +90,7 @@ python -m pytest -q
 ```powershell
 curl -Method Post -Uri http://localhost:8080/path -ContentType application/json -Body '{"start_stop_id":"A","end_stop_id":"C","departure_time":900}'
 ```
+
+## Todo
+- [ ] Add more detailed logging (e.g., query times, pathfinding times)
+- [ ] Implement more comprehensive error handling (e.g., invalid input, database errors)
