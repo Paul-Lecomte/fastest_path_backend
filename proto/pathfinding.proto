@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package pathfinding;
+
+service RouteSearch {
+  rpc GetFastestPath (PathRequest) returns (PathResponse) {}
+}
+
+message PathRequest {
+  string start_stop_id = 1;
+  string end_stop_id = 2;
+  int64 departure_time = 3; // Unix timestamp
+}
+
+message Path {
+  string trip_id = 1;
+  string stop_id = 2;
+  int64 arrival_time = 3;
+}
+
+message PathResponse {
+  repeated Path segments = 1;
+}
+
