@@ -1,40 +1,40 @@
 # RAPTOR Pathfinding Microservice (Python)
 
-Microservice de pathfinding haute performance utilisant:
+High-performance pathfinding microservice using:
 
-- Neo4j pour le stockage graphe
-- NumPy pour la mise en memoire contigue
-- Numba pour compiler la boucle RAPTOR
-- gRPC pour la communication faible latence
+- Neo4j for graph storage
+- NumPy for contiguous in-memory arrays
+- Numba to compile the RAPTOR loop
+- gRPC for low-latency communication
 
-## API HTTP
+## HTTP API
 
-Endpoint unique:
+Single endpoint:
 
 - `POST /path`
-- Corps JSON: `{"start_stop_id":"A","end_stop_id":"C","departure_time":900}`
+- JSON body: `{"start_stop_id":"A","end_stop_id":"C","departure_time":900}`
 
-Reponse:
+Response:
 
 ```json
 {"segments":[{"trip_id":"T1","stop_id":"C","arrival_time":1100}]}
 ```
 
-## Demarrage rapide
+## Quick start
 
-1) Installer les dependances
+1) Install dependencies
 
 ```powershell
 python -m pip install -r requirements.txt
 ```
 
-2) Generer le code gRPC
+2) Generate gRPC code
 
 ```powershell
 python -m grpc_tools.protoc -I proto --python_out=src --grpc_python_out=src proto/pathfinding.proto
 ```
 
-3) Lancer le serveur (commande unique)
+3) Run the server (single command)
 
 ```powershell
 python -m src.main
@@ -42,24 +42,24 @@ python -m src.main
 
 ## Logs
 
-Le niveau de logs est configure via `LOG_LEVEL` (ex: `DEBUG`, `INFO`).
+The log level is configured via `LOG_LEVEL` (e.g., `DEBUG`, `INFO`).
 
-## Remarques sur Numba / Python 3.13
+## Notes on Numba / Python 3.13
 
-Numba ne supporte pas encore Python 3.13. Le code fonctionne sans Numba (mode Python pur),
-mais pour l'acceleration JIT, utilisez Python 3.12 et installez `numba`.
+Numba does not yet support Python 3.13. The code runs without Numba (pure Python mode),
+but for JIT acceleration, use Python 3.12 and install `numba`.
 
 ## Configuration
 
-Variables d'environnement optionnelles:
+Optional environment variables:
 
-- `NEO4J_URI` (ex: `neo4j://127.0.0.1:7687`)
+- `NEO4J_URI` (e.g., `neo4j://127.0.0.1:7687`)
 - `NEO4J_USER`
 - `NEO4J_PASSWORD`
 
-Vous pouvez aussi creer un fichier `.env` a la racine du projet avec ces variables.
+You can also create a `.env` file at the project root containing these variables.
 
-Sans Neo4j, le serveur charge un petit reseau factice pour test.
+Without Neo4j, the server loads a small dummy network for testing.
 
 ## Tests
 
@@ -67,9 +67,9 @@ Sans Neo4j, le serveur charge un petit reseau factice pour test.
 python -m pytest -q
 ```
 
-## Tester avec Postman
+## Test with Postman
 
-- Methode: `POST`
+- Method: `POST`
 - URL: `http://localhost:8080/path`
 - Body: `raw` -> `JSON`
 
@@ -81,7 +81,7 @@ python -m pytest -q
 }
 ```
 
-## Tester avec curl
+## Test with curl
 
 ```powershell
 curl -Method Post -Uri http://localhost:8080/path -ContentType application/json -Body '{"start_stop_id":"A","end_stop_id":"C","departure_time":900}'
