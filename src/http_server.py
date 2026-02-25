@@ -4,6 +4,7 @@ import json
 import logging
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from datetime import datetime
 
 from .config import setup_logging
 from .loader import NetworkLoader, build_mock_network, TransitNetwork
@@ -11,6 +12,21 @@ from .solver import build_path, run_raptor
 
 
 logger = logging.getLogger("pathfinding.http")
+
+
+def _departure_to_seconds(value: Any) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        return parsed.hour * 3600 + parsed.minute * 60 + parsed.second
+    return None
 
 
 def load_network() -> TransitNetwork:
@@ -49,12 +65,14 @@ class PathRequestHandler(BaseHTTPRequestHandler):
 
         start_stop_id = payload.get("start_stop_id")
         end_stop_id = payload.get("end_stop_id")
-        departure_time = payload.get("departure_time")
+        departure_raw = payload.get("departure_time")
 
         if not isinstance(start_stop_id, str) or not isinstance(end_stop_id, str):
             self._send_json(400, {"error": "invalid_stop_id"})
             return
-        if not isinstance(departure_time, int):
+
+        departure_time = _departure_to_seconds(departure_raw)
+        if departure_time is None:
             self._send_json(400, {"error": "invalid_departure_time"})
             return
 

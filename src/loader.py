@@ -2,9 +2,35 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
-
+import logging
 import numpy as np
 from neo4j import GraphDatabase
+
+
+logger = logging.getLogger("pathfinding.loader")
+
+
+def parse_time_to_seconds(value) -> int:
+    if value is None:
+        raise ValueError("arrival_time is None")
+    if isinstance(value, (np.integer, int)):
+        return int(value)
+    if isinstance(value, (np.floating, float)):
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isdigit():
+            return int(text)
+        parts = text.split(":")
+        if len(parts) == 2:
+            hours, minutes = parts
+            seconds = 0
+        elif len(parts) == 3:
+            hours, minutes, seconds = parts
+        else:
+            raise ValueError(f"Unsupported time format: {value}")
+        return int(hours) * 3600 + int(minutes) * 60 + int(seconds)
+    raise ValueError(f"Unsupported time type: {type(value)}")
 
 
 STOP_TIMES_DTYPE = np.dtype(
@@ -70,7 +96,17 @@ class NetworkLoader:
                 arrival_time = record["arrival_time"]
                 if arrival_time is None:
                     continue
-                arrival_time = int(arrival_time)
+                try:
+                    arrival_time = parse_time_to_seconds(arrival_time)
+                except ValueError as exc:
+                    logger.warning(
+                        "Skipping stop_time stop_id=%s trip_id=%s arrival_time=%s error=%s",
+                        stop_id,
+                        trip_id,
+                        arrival_time,
+                        exc,
+                    )
+                    continue
 
                 if stop_id not in stop_id_index:
                     stop_id_index[stop_id] = len(stop_ids)

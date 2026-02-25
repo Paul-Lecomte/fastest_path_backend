@@ -20,6 +20,11 @@ Response:
 {"segments":[{"trip_id":"T1","stop_id":"C","arrival_time":1100}]}
 ```
 
+`departure_time` accepts either:
+
+- `int` seconds since midnight
+- ISO-8601 datetime string, e.g. `"2026-02-25T08:13:00"`
+
 ## Quick start
 
 1) Install dependencies
@@ -61,6 +66,8 @@ You can also create a `.env` file at the project root containing these variables
 
 Without Neo4j, the server loads a small dummy network for testing.
 
+Neo4j stop times are parsed from `HH:MM:SS` or numeric values into seconds.
+
 ## Tests
 
 ```powershell
@@ -77,7 +84,7 @@ python -m pytest -q
 {
   "start_stop_id": "A",
   "end_stop_id": "C",
-  "departure_time": 900
+  "departure_time": "2026-02-25T08:13:00"
 }
 ```
 
