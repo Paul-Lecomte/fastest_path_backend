@@ -86,8 +86,22 @@ class PathRequestHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "unknown_stop_id"})
             return
 
-        earliest = run_raptor(self.network.stop_times, start_idx, end_idx, departure_time)
-        segments = build_path(self.network.stop_times, end_idx, earliest)
+        earliest, pred_stop, pred_trip, pred_time = run_raptor(
+            self.network.stop_times,
+            self.network.trip_offsets,
+            start_idx,
+            end_idx,
+            departure_time,
+        )
+        segments = build_path(
+            self.network.stop_times,
+            self.network.trip_offsets,
+            end_idx,
+            earliest,
+            pred_stop,
+            pred_trip,
+            pred_time,
+        )
         response = {
             "segments": [
                 {

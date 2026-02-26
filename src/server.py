@@ -32,19 +32,28 @@ class RouteSearchServicer(pathfinding_pb2_grpc.RouteSearchServicer):
         if start_stop_id is None or end_stop_id is None:
             await context.abort(grpc.StatusCode.NOT_FOUND, "Unknown stop_id")
 
-        earliest = run_raptor(
+        earliest, pred_stop, pred_trip, pred_time = run_raptor(
             self.network.stop_times,
+            self.network.trip_offsets,
             start_stop_id,
             end_stop_id,
             request.departure_time,
         )
 
-        segments = build_path(self.network.stop_times, end_stop_id, earliest)
+        segments = build_path(
+            self.network.stop_times,
+            self.network.trip_offsets,
+            end_stop_id,
+            earliest,
+            pred_stop,
+            pred_trip,
+            pred_time,
+        )
         response = pathfinding_pb2.PathResponse()
         for trip_id, stop_id, arrival_time in segments:
             response.segments.add(
-                trip_id=str(trip_id),
-                stop_id=str(stop_id),
+                trip_id=self.network.trip_ids[trip_id],
+                stop_id=self.network.stop_ids[stop_id],
                 arrival_time=int(arrival_time),
             )
 

@@ -20,10 +20,7 @@ Response:
 {"segments":[{"trip_id":"T1","stop_id":"C","arrival_time":1100}]}
 ```
 
-`departure_time` accepts either:
-
-- `int` seconds since midnight
-- ISO-8601 datetime string, e.g. `"2026-02-25T08:13:00"`
+Segments can include multiple trips when a transfer is required.
 
 ## Quick start
 
