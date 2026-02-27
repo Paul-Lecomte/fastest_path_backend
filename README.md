@@ -92,5 +92,6 @@ curl -Method Post -Uri http://localhost:8080/path -ContentType application/json 
 ```
 
 ## Todo
+- [ ] Working RAPTOR implementation with real data from Neo4j
 - [ ] Add more detailed logging (e.g., query times, pathfinding times)
 - [ ] Implement more comprehensive error handling (e.g., invalid input, database errors)
