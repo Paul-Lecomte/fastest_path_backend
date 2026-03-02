@@ -8,7 +8,7 @@ from datetime import datetime
 
 from .config import setup_logging
 from .loader import NetworkLoader, build_mock_network, TransitNetwork
-from .solver import build_path, run_raptor
+from .solver import build_path, build_path_dijkstra, run_dijkstra, run_raptor
 
 
 logger = logging.getLogger("pathfinding.http")
@@ -66,10 +66,16 @@ class PathRequestHandler(BaseHTTPRequestHandler):
         start_stop_id = payload.get("start_stop_id")
         end_stop_id = payload.get("end_stop_id")
         departure_raw = payload.get("departure_time")
+        algorithm = payload.get("algorithm", "raptor")
 
         if not isinstance(start_stop_id, str) or not isinstance(end_stop_id, str):
             self._send_json(400, {"error": "invalid_stop_id"})
             return
+
+        if not isinstance(algorithm, str):
+            self._send_json(400, {"error": "invalid_algorithm"})
+            return
+        algorithm = algorithm.strip().lower()
 
         departure_time = _departure_to_seconds(departure_raw)
         if departure_time is None:
@@ -86,23 +92,45 @@ class PathRequestHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "unknown_stop_id"})
             return
 
-        earliest, pred_stop, pred_trip, pred_time = run_raptor(
-            self.network.stop_times,
-            self.network.trip_offsets,
-            start_idx,
-            end_idx,
-            departure_time,
-        )
-        segments = build_path(
-            self.network.stop_times,
-            self.network.trip_offsets,
-            end_idx,
-            earliest,
-            pred_stop,
-            pred_trip,
-            pred_time,
-        )
+        if algorithm == "raptor":
+            earliest, pred_stop, pred_trip, pred_time = run_raptor(
+                self.network.stop_times,
+                self.network.trip_offsets,
+                start_idx,
+                end_idx,
+                departure_time,
+            )
+            segments = build_path(
+                self.network.stop_times,
+                self.network.trip_offsets,
+                end_idx,
+                earliest,
+                pred_stop,
+                pred_trip,
+                pred_time,
+            )
+        elif algorithm == "dijkstra":
+            dist, pred_stop, pred_trip = run_dijkstra(
+                self.network.adj_offsets,
+                self.network.adj_neighbors,
+                self.network.adj_weights,
+                self.network.adj_trip_ids,
+                start_idx,
+                end_idx,
+                departure_time,
+            )
+            segments = build_path_dijkstra(
+                end_idx,
+                dist,
+                pred_stop,
+                pred_trip,
+            )
+        else:
+            self._send_json(400, {"error": "unsupported_algorithm"})
+            return
+
         response = {
+            "algorithm": algorithm,
             "segments": [
                 {
                     "trip_id": self.network.trip_ids[trip_id],
@@ -110,10 +138,11 @@ class PathRequestHandler(BaseHTTPRequestHandler):
                     "arrival_time": int(arrival_time),
                 }
                 for trip_id, stop_id, arrival_time in segments
-            ]
+            ],
         }
         logger.info(
-            "HTTP /path start=%s end=%s departure=%s segments=%s",
+            "HTTP /path algorithm=%s start=%s end=%s departure=%s segments=%s",
+            algorithm,
             start_stop_id,
             end_stop_id,
             departure_time,

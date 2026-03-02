@@ -67,6 +67,10 @@ class TransitNetwork:
     stop_ids: List[str]
     trip_ids: List[str]
     trip_offsets: np.ndarray
+    adj_offsets: np.ndarray
+    adj_neighbors: np.ndarray
+    adj_weights: np.ndarray
+    adj_trip_ids: np.ndarray
 
 
 class NetworkLoader:
@@ -154,6 +158,10 @@ class NetworkLoader:
         for idx in range(current_trip + 1, len(trip_offsets)):
             trip_offsets[idx] = len(rows)
 
+        adj_offsets, adj_neighbors, adj_weights, adj_trip_ids = _build_adjacency(
+            stop_times_array, trip_offsets, len(stop_ids)
+        )
+
         return TransitNetwork(
             stops=stops_array,
             stop_times=stop_times_array,
@@ -163,7 +171,54 @@ class NetworkLoader:
             stop_ids=stop_ids,
             trip_ids=trip_ids,
             trip_offsets=trip_offsets,
+            adj_offsets=adj_offsets,
+            adj_neighbors=adj_neighbors,
+            adj_weights=adj_weights,
+            adj_trip_ids=adj_trip_ids,
         )
+
+
+def _build_adjacency(stop_times: np.ndarray, trip_offsets: np.ndarray, n_stops: int):
+    # Build a stop->stop graph using minimum in-trip travel times.
+    edges = [dict() for _ in range(n_stops)]
+    trip_edges = [dict() for _ in range(n_stops)]
+
+    for trip_id in range(trip_offsets.shape[0] - 1):
+        start = int(trip_offsets[trip_id])
+        end = int(trip_offsets[trip_id + 1])
+        if start >= end:
+            continue
+        prev_stop = int(stop_times[start][0])
+        prev_time = int(stop_times[start][2])
+        for i in range(start + 1, end):
+            stop_id = int(stop_times[i][0])
+            arrival_time = int(stop_times[i][2])
+            travel_time = arrival_time - prev_time
+            if travel_time >= 0:
+                current = edges[prev_stop].get(stop_id)
+                if current is None or travel_time < current:
+                    edges[prev_stop][stop_id] = travel_time
+                    trip_edges[prev_stop][stop_id] = trip_id
+            prev_stop = stop_id
+            prev_time = arrival_time
+
+    total_edges = sum(len(item) for item in edges)
+    adj_offsets = np.zeros(n_stops + 1, dtype=np.int64)
+    adj_neighbors = np.zeros(total_edges, dtype=np.int32)
+    adj_weights = np.zeros(total_edges, dtype=np.int64)
+    adj_trip_ids = np.zeros(total_edges, dtype=np.int32)
+
+    cursor = 0
+    for stop_id in range(n_stops):
+        adj_offsets[stop_id] = cursor
+        for neighbor, weight in edges[stop_id].items():
+            adj_neighbors[cursor] = neighbor
+            adj_weights[cursor] = weight
+            adj_trip_ids[cursor] = trip_edges[stop_id][neighbor]
+            cursor += 1
+    adj_offsets[n_stops] = cursor
+
+    return adj_offsets, adj_neighbors, adj_weights, adj_trip_ids
 
 
 def build_mock_network() -> TransitNetwork:
@@ -192,6 +247,10 @@ def build_mock_network() -> TransitNetwork:
     trip_id_index = {"T1": 0, "T2": 1}
     trip_offsets = np.array([0, 2, 4], dtype=np.int64)
 
+    adj_offsets, adj_neighbors, adj_weights, adj_trip_ids = _build_adjacency(
+        stop_times_array, trip_offsets, len(stop_ids)
+    )
+
     return TransitNetwork(
         stops=stops_array,
         stop_times=stop_times_array,
@@ -201,4 +260,8 @@ def build_mock_network() -> TransitNetwork:
         stop_ids=stop_ids,
         trip_ids=trip_ids,
         trip_offsets=trip_offsets,
+        adj_offsets=adj_offsets,
+        adj_neighbors=adj_neighbors,
+        adj_weights=adj_weights,
+        adj_trip_ids=adj_trip_ids,
     )

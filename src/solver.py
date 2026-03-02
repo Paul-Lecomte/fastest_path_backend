@@ -58,6 +58,42 @@ def run_raptor(stop_times, trip_offsets, start_stop_id: int, end_stop_id: int, d
     return earliest, pred_stop, pred_trip, pred_time
 
 
+@njit(cache=True)
+def run_dijkstra(adj_offsets, adj_neighbors, adj_weights, adj_trip_ids, start_stop_id: int, end_stop_id: int, departure_time: int):
+    n_stops = adj_offsets.shape[0] - 1
+    inf = np.int64(2**62)
+    dist = np.full(n_stops, inf, dtype=np.int64)
+    visited = np.zeros(n_stops, dtype=np.uint8)
+    pred_stop = np.full(n_stops, -1, dtype=np.int64)
+    pred_trip = np.full(n_stops, -1, dtype=np.int64)
+
+    dist[start_stop_id] = departure_time
+
+    for _ in range(n_stops):
+        best = inf
+        u = -1
+        for i in range(n_stops):
+            if visited[i] == 0 and dist[i] < best:
+                best = dist[i]
+                u = i
+        if u == -1 or u == end_stop_id:
+            break
+        visited[u] = 1
+
+        start = adj_offsets[u]
+        end = adj_offsets[u + 1]
+        for idx in range(start, end):
+            v = adj_neighbors[idx]
+            w = adj_weights[idx]
+            alt = dist[u] + w
+            if alt < dist[v]:
+                dist[v] = alt
+                pred_stop[v] = u
+                pred_trip[v] = adj_trip_ids[idx]
+
+    return dist, pred_stop, pred_trip
+
+
 def build_path(stop_times, trip_offsets, end_stop_id: int, earliest, pred_stop, pred_trip, pred_time):
     segments = []
     best_time = earliest[end_stop_id]
@@ -75,3 +111,22 @@ def build_path(stop_times, trip_offsets, end_stop_id: int, earliest, pred_stop, 
 
     segments.reverse()
     return segments
+
+
+def build_path_dijkstra(end_stop_id: int, dist, pred_stop, pred_trip):
+    segments = []
+    best_time = dist[end_stop_id]
+    if best_time <= 0 or best_time >= 2**61:
+        return segments
+
+    current_stop = end_stop_id
+    while current_stop != -1:
+        trip_id = int(pred_trip[current_stop])
+        if trip_id == -1:
+            break
+        segments.append((trip_id, current_stop, int(dist[current_stop])))
+        current_stop = int(pred_stop[current_stop])
+
+    segments.reverse()
+    return segments
+
