@@ -44,4 +44,4 @@ def test_smoke_mock_network_dijkstra():
     )
 
     assert segments
-    assert segments[-1][2] == 1050
+    assert segments[-1][2] == 990

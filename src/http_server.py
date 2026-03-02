@@ -14,6 +14,18 @@ from .solver import build_path, build_path_dijkstra, run_dijkstra, run_raptor
 logger = logging.getLogger("pathfinding.http")
 
 
+def _count_transfers(segments) -> int:
+    if not segments:
+        return 0
+    transfers = 0
+    current_trip = segments[0][0]
+    for trip_id, _, _ in segments[1:]:
+        if trip_id != current_trip:
+            transfers += 1
+            current_trip = trip_id
+    return transfers
+
+
 def _departure_to_seconds(value: Any) -> int | None:
     if isinstance(value, int):
         return value
@@ -131,6 +143,8 @@ class PathRequestHandler(BaseHTTPRequestHandler):
 
         response = {
             "algorithm": algorithm,
+            "transfers": _count_transfers(segments),
+            "duration_seconds": int(segments[-1][2] - departure_time) if segments else None,
             "segments": [
                 {
                     "trip_id": self.network.trip_ids[trip_id],
