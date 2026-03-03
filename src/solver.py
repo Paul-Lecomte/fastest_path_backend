@@ -94,6 +94,54 @@ def run_dijkstra(adj_offsets, adj_neighbors, adj_weights, adj_trip_ids, start_st
     return dist, pred_stop, pred_trip
 
 
+@njit(cache=True)
+def run_astar(
+    adj_offsets,
+    adj_neighbors,
+    adj_weights,
+    adj_trip_ids,
+    start_stop_id: int,
+    end_stop_id: int,
+    departure_time: int,
+    heuristic,
+):
+    n_stops = adj_offsets.shape[0] - 1
+    inf = np.int64(2**62)
+    dist = np.full(n_stops, inf, dtype=np.int64)
+    fscore = np.full(n_stops, inf, dtype=np.int64)
+    visited = np.zeros(n_stops, dtype=np.uint8)
+    pred_stop = np.full(n_stops, -1, dtype=np.int64)
+    pred_trip = np.full(n_stops, -1, dtype=np.int64)
+
+    dist[start_stop_id] = departure_time
+    fscore[start_stop_id] = departure_time + heuristic[start_stop_id]
+
+    for _ in range(n_stops):
+        best = inf
+        u = -1
+        for i in range(n_stops):
+            if visited[i] == 0 and fscore[i] < best:
+                best = fscore[i]
+                u = i
+        if u == -1 or u == end_stop_id:
+            break
+        visited[u] = 1
+
+        start = adj_offsets[u]
+        end = adj_offsets[u + 1]
+        for idx in range(start, end):
+            v = adj_neighbors[idx]
+            w = adj_weights[idx]
+            alt = dist[u] + w
+            if alt < dist[v]:
+                dist[v] = alt
+                fscore[v] = alt + heuristic[v]
+                pred_stop[v] = u
+                pred_trip[v] = adj_trip_ids[idx]
+
+    return dist, pred_stop, pred_trip
+
+
 def build_path(stop_times, trip_offsets, end_stop_id: int, earliest, pred_stop, pred_trip, pred_time):
     segments = []
     best_time = earliest[end_stop_id]

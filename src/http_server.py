@@ -6,9 +6,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from datetime import datetime
 
+import numpy as np
+
 from .config import setup_logging
 from .loader import NetworkLoader, build_mock_network, TransitNetwork
-from .solver import build_path, build_path_dijkstra, run_dijkstra, run_raptor
+from .solver import build_path, build_path_dijkstra, run_dijkstra, run_raptor, run_astar
 
 
 logger = logging.getLogger("pathfinding.http")
@@ -130,6 +132,24 @@ class PathRequestHandler(BaseHTTPRequestHandler):
                 start_idx,
                 end_idx,
                 departure_time,
+            )
+            segments = build_path_dijkstra(
+                end_idx,
+                dist,
+                pred_stop,
+                pred_trip,
+            )
+        elif algorithm == "astar":
+            heuristic = np.zeros(self.network.adj_offsets.shape[0] - 1, dtype=np.int64)
+            dist, pred_stop, pred_trip = run_astar(
+                self.network.adj_offsets,
+                self.network.adj_neighbors,
+                self.network.adj_weights,
+                self.network.adj_trip_ids,
+                start_idx,
+                end_idx,
+                departure_time,
+                heuristic,
             )
             segments = build_path_dijkstra(
                 end_idx,

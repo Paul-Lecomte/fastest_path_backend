@@ -1,5 +1,7 @@
+import numpy as np
+
 from src.loader import build_mock_network
-from src.solver import build_path, build_path_dijkstra, run_dijkstra, run_raptor
+from src.solver import build_path, build_path_dijkstra, run_dijkstra, run_raptor, run_astar
 
 
 def test_smoke_mock_network():
@@ -35,6 +37,30 @@ def test_smoke_mock_network_dijkstra():
         0,
         2,
         900,
+    )
+    segments = build_path_dijkstra(
+        2,
+        dist,
+        pred_stop,
+        pred_trip,
+    )
+
+    assert segments
+    assert segments[-1][2] == 990
+
+
+def test_smoke_mock_network_astar():
+    network = build_mock_network()
+    heuristic = np.zeros(network.adj_offsets.shape[0] - 1, dtype=np.int64)
+    dist, pred_stop, pred_trip = run_astar(
+        network.adj_offsets,
+        network.adj_neighbors,
+        network.adj_weights,
+        network.adj_trip_ids,
+        0,
+        2,
+        900,
+        heuristic,
     )
     segments = build_path_dijkstra(
         2,

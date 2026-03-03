@@ -5,11 +5,12 @@ from concurrent.futures import ThreadPoolExecutor
 import logging
 
 import grpc
+import numpy as np
 
 from . import pathfinding_pb2, pathfinding_pb2_grpc
 from .config import get_neo4j_config, setup_logging
 from .loader import NetworkLoader, build_mock_network
-from .solver import build_path, build_path_dijkstra, run_dijkstra, run_raptor
+from .solver import build_path, build_path_dijkstra, run_dijkstra, run_raptor, run_astar
 
 
 logger = logging.getLogger("pathfinding.server")
@@ -62,6 +63,24 @@ class RouteSearchServicer(pathfinding_pb2_grpc.RouteSearchServicer):
                 start_stop_id,
                 end_stop_id,
                 request.departure_time,
+            )
+            segments = build_path_dijkstra(
+                end_stop_id,
+                dist,
+                pred_stop,
+                pred_trip,
+            )
+        elif algorithm == "astar":
+            heuristic = np.zeros(self.network.adj_offsets.shape[0] - 1, dtype=np.int64)
+            dist, pred_stop, pred_trip = run_astar(
+                self.network.adj_offsets,
+                self.network.adj_neighbors,
+                self.network.adj_weights,
+                self.network.adj_trip_ids,
+                start_stop_id,
+                end_stop_id,
+                request.departure_time,
+                heuristic,
             )
             segments = build_path_dijkstra(
                 end_stop_id,
