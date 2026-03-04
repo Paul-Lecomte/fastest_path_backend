@@ -1,3 +1,4 @@
+# This module implements a simple HTTP server that provides a pathfinding API for transit networks.
 from __future__ import annotations
 
 import json
