@@ -1,3 +1,4 @@
+# A gRPC server that provides a route search service using the pathfinding algorithms implemented in solver.py.
 from __future__ import annotations
 
 import asyncio

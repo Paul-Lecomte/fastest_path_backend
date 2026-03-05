@@ -1,3 +1,4 @@
+# This module defines the NetworkLoader class, which is responsible for loading transit network data from a Neo4j database and converting it into a format suitable for pathfinding algorithms. The loader fetches stop times, routes, and stops from the database, processes the data to build an adjacency list representation of the transit network, and returns a TransitNetwork object containing all the relevant information.
 from __future__ import annotations
 
 from dataclasses import dataclass

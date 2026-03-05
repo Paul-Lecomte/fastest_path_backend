@@ -1,3 +1,4 @@
+# This module implements the core algorithms for route planning, including RAPTOR, Dijkstra's algorithm, and A* search.
 from __future__ import annotations
 
 import numpy as np

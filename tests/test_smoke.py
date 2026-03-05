@@ -1,3 +1,4 @@
+# This file contains smoke tests for the RAPTOR, Dijkstra, and A* algorithms on a mock transportation network.
 import numpy as np
 
 from src.loader import build_mock_network

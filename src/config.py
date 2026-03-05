@@ -1,3 +1,4 @@
+# This module provides configuration utilities for the application, including environment variable handling and logging setup.
 import os
 import logging
 
