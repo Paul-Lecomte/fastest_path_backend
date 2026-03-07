@@ -92,6 +92,7 @@ curl -Method Post -Uri http://localhost:8080/path -ContentType application/json 
 ```
 
 ## Todo
-- [ ] Working RAPTOR implementation with real data from Neo4j
-- [ ] Add more detailed logging (e.g., query times, pathfinding times)
+- [x] Working RAPTOR implementation with real data from Neo4j
+- [x] Add more detailed logging (e.g., query times, pathfinding times)
+- [ ] Implement the returned data for the frontend and a function to fetch the geometry for the trip
 - [ ] Implement more comprehensive error handling (e.g., invalid input, database errors)
