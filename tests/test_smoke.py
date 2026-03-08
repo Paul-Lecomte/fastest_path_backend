@@ -2,7 +2,7 @@
 import numpy as np
 
 from src.loader import build_mock_network
-from src.solver import build_path, build_path_dijkstra, run_dijkstra, run_raptor, run_astar
+from src.solver import build_path, build_path_dijkstra, run_dijkstra_fast, run_raptor, run_astar_fast
 from src.http_server import build_multi_departure_response
 
 
@@ -31,7 +31,7 @@ def test_smoke_mock_network():
 
 def test_smoke_mock_network_dijkstra():
     network = build_mock_network()
-    dist, pred_stop, pred_trip = run_dijkstra(
+    dist, pred_stop, pred_trip = run_dijkstra_fast(
         network.adj_offsets,
         network.adj_neighbors,
         network.adj_weights,
@@ -54,7 +54,7 @@ def test_smoke_mock_network_dijkstra():
 def test_smoke_mock_network_astar():
     network = build_mock_network()
     heuristic = np.zeros(network.adj_offsets.shape[0] - 1, dtype=np.int64)
-    dist, pred_stop, pred_trip = run_astar(
+    dist, pred_stop, pred_trip = run_astar_fast(
         network.adj_offsets,
         network.adj_neighbors,
         network.adj_weights,
