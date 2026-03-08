@@ -16,6 +16,8 @@ from .solver import build_path, build_path_dijkstra, run_dijkstra, run_raptor, r
 
 logger = logging.getLogger("pathfinding.http")
 
+DEFAULT_OFFSET_MINUTES = (0, 10, 20, 30, 40)
+
 
 def _count_transfers(segments) -> int:
     if not segments:
@@ -66,6 +68,127 @@ def load_network() -> TransitNetwork:
         loader.close()
 
 
+def _compute_segments(
+    network: TransitNetwork,
+    algorithm: str,
+    start_idx: int,
+    end_idx: int,
+    departure_time: int,
+):
+    if algorithm == "raptor":
+        earliest, pred_stop, pred_trip, pred_time = run_raptor(
+            network.stop_times,
+            network.trip_offsets,
+            start_idx,
+            end_idx,
+            departure_time,
+        )
+        return build_path(
+            network.stop_times,
+            network.trip_offsets,
+            end_idx,
+            earliest,
+            pred_stop,
+            pred_trip,
+            pred_time,
+        )
+    if algorithm == "dijkstra":
+        dist, pred_stop, pred_trip = run_dijkstra(
+            network.adj_offsets,
+            network.adj_neighbors,
+            network.adj_weights,
+            network.adj_trip_ids,
+            start_idx,
+            end_idx,
+            departure_time,
+        )
+        return build_path_dijkstra(
+            end_idx,
+            dist,
+            pred_stop,
+            pred_trip,
+        )
+    if algorithm == "astar":
+        heuristic = np.zeros(network.adj_offsets.shape[0] - 1, dtype=np.int64)
+        dist, pred_stop, pred_trip = run_astar(
+            network.adj_offsets,
+            network.adj_neighbors,
+            network.adj_weights,
+            network.adj_trip_ids,
+            start_idx,
+            end_idx,
+            departure_time,
+            heuristic,
+        )
+        return build_path_dijkstra(
+            end_idx,
+            dist,
+            pred_stop,
+            pred_trip,
+        )
+    return None
+
+
+def _build_option_response(
+    network: TransitNetwork,
+    algorithm: str,
+    start_idx: int,
+    end_idx: int,
+    departure_time: int,
+) -> dict[str, Any]:
+    segments = _compute_segments(network, algorithm, start_idx, end_idx, departure_time)
+    if segments is None:
+        return {}
+    return {
+        "departure_time": int(departure_time),
+        "transfers": _count_transfers(segments),
+        "duration_seconds": int(segments[-1][2] - departure_time) if segments else None,
+        "segments": [
+            {
+                "trip_id": network.trip_ids[trip_id],
+                "stop_id": network.stop_ids[stop_id],
+                "arrival_time": int(arrival_time),
+            }
+            for trip_id, stop_id, arrival_time in segments
+        ],
+    }
+
+
+def build_multi_departure_response(
+    network: TransitNetwork,
+    algorithm: str,
+    start_idx: int,
+    end_idx: int,
+    departure_time: int,
+    offset_minutes: tuple[int, ...] = DEFAULT_OFFSET_MINUTES,
+) -> dict[str, Any]:
+    options = []
+    for minutes in offset_minutes:
+        offset_departure = departure_time + minutes * 60
+        option = _build_option_response(
+            network,
+            algorithm,
+            start_idx,
+            end_idx,
+            offset_departure,
+        )
+        options.append(option)
+
+    base = options[0] if options else {
+        "departure_time": int(departure_time),
+        "transfers": 0,
+        "duration_seconds": None,
+        "segments": [],
+    }
+    return {
+        "algorithm": algorithm,
+        "transfers": base.get("transfers"),
+        "duration_seconds": base.get("duration_seconds"),
+        "segments": base.get("segments"),
+        "options": options,
+    }
+
+
 class PathRequestHandler(BaseHTTPRequestHandler):
     network: TransitNetwork | None = None
 
@@ -107,81 +230,24 @@ class PathRequestHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "unknown_stop_id"})
             return
 
-        if algorithm == "raptor":
-            earliest, pred_stop, pred_trip, pred_time = run_raptor(
-                self.network.stop_times,
-                self.network.trip_offsets,
-                start_idx,
-                end_idx,
-                departure_time,
-            )
-            segments = build_path(
-                self.network.stop_times,
-                self.network.trip_offsets,
-                end_idx,
-                earliest,
-                pred_stop,
-                pred_trip,
-                pred_time,
-            )
-        elif algorithm == "dijkstra":
-            dist, pred_stop, pred_trip = run_dijkstra(
-                self.network.adj_offsets,
-                self.network.adj_neighbors,
-                self.network.adj_weights,
-                self.network.adj_trip_ids,
-                start_idx,
-                end_idx,
-                departure_time,
-            )
-            segments = build_path_dijkstra(
-                end_idx,
-                dist,
-                pred_stop,
-                pred_trip,
-            )
-        elif algorithm == "astar":
-            heuristic = np.zeros(self.network.adj_offsets.shape[0] - 1, dtype=np.int64)
-            dist, pred_stop, pred_trip = run_astar(
-                self.network.adj_offsets,
-                self.network.adj_neighbors,
-                self.network.adj_weights,
-                self.network.adj_trip_ids,
-                start_idx,
-                end_idx,
-                departure_time,
-                heuristic,
-            )
-            segments = build_path_dijkstra(
-                end_idx,
-                dist,
-                pred_stop,
-                pred_trip,
-            )
-        else:
+        if algorithm not in {"raptor", "dijkstra", "astar"}:
             self._send_json(400, {"error": "unsupported_algorithm"})
             return
 
-        response = {
-            "algorithm": algorithm,
-            "transfers": _count_transfers(segments),
-            "duration_seconds": int(segments[-1][2] - departure_time) if segments else None,
-            "segments": [
-                {
-                    "trip_id": self.network.trip_ids[trip_id],
-                    "stop_id": self.network.stop_ids[stop_id],
-                    "arrival_time": int(arrival_time),
-                }
-                for trip_id, stop_id, arrival_time in segments
-            ],
-        }
+        response = build_multi_departure_response(
+            self.network,
+            algorithm,
+            start_idx,
+            end_idx,
+            departure_time,
+        )
         logger.info(
-            "HTTP /path algorithm=%s start=%s end=%s departure=%s segments=%s",
+            "HTTP /path algorithm=%s start=%s end=%s departure=%s options=%s",
             algorithm,
             start_stop_id,
             end_stop_id,
             departure_time,
-            len(segments),
+            len(response.get("options", [])),
         )
         self._send_json(200, response)
 
