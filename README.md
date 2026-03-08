@@ -17,7 +17,30 @@ Single endpoint:
 Response:
 
 ```json
-{"segments":[{"trip_id":"T1","stop_id":"C","arrival_time":1100}]}
+{
+  "algorithm": "raptor",
+  "transfers": 0,
+  "duration_seconds": 200,
+  "segments": [
+    {"trip_id": "T1", "stop_id": "C", "arrival_time": 1100}
+  ],
+  "options": [
+    {
+      "departure_time": 900,
+      "transfers": 0,
+      "duration_seconds": 200,
+      "segments": [
+        {"trip_id": "T1", "stop_id": "C", "arrival_time": 1100}
+      ]
+    },
+    {
+      "departure_time": 1500,
+      "transfers": 0,
+      "duration_seconds": null,
+      "segments": []
+    }
+  ]
+}
 ```
 
 Segments can include multiple trips when a transfer is required.
