@@ -3,6 +3,7 @@ import numpy as np
 
 from src.loader import build_mock_network
 from src.solver import build_path, build_path_dijkstra, run_dijkstra, run_raptor, run_astar
+from src.http_server import build_multi_departure_response
 
 
 def test_smoke_mock_network():
@@ -72,3 +73,23 @@ def test_smoke_mock_network_astar():
 
     assert segments
     assert segments[-1][2] == 990
+
+
+def test_multi_departure_response_offsets():
+    network = build_mock_network()
+    response = build_multi_departure_response(
+        network,
+        "raptor",
+        network.stop_id_index["A"],
+        network.stop_id_index["C"],
+        900,
+    )
+
+    assert response["options"]
+    assert len(response["options"]) == 5
+    assert response["options"][0]["departure_time"] == 900
+    assert response["options"][1]["departure_time"] == 1500
+    assert response["options"][2]["departure_time"] == 2100
+    assert response["options"][3]["departure_time"] == 2700
+    assert response["options"][4]["departure_time"] == 3300
+    assert response["options"][0]["segments"]
