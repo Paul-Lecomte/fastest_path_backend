@@ -2,10 +2,14 @@
 from __future__ import annotations
 
 import numpy as np
+import heapq
 
 try:
     from numba import njit
+    _NUMBA_AVAILABLE = True
 except Exception:  # pragma: no cover - fallback when numba is unavailable
+    _NUMBA_AVAILABLE = False
+
     def njit(*_args, **_kwargs):
         def wrapper(func):
             return func
@@ -59,6 +63,45 @@ def run_raptor(stop_times, trip_offsets, start_stop_id: int, end_stop_id: int, d
     return earliest, pred_stop, pred_trip, pred_time
 
 
+def _run_dijkstra_heap(
+    adj_offsets,
+    adj_neighbors,
+    adj_weights,
+    adj_trip_ids,
+    start_stop_id: int,
+    end_stop_id: int,
+    departure_time: int,
+):
+    n_stops = adj_offsets.shape[0] - 1
+    inf = 2**62
+    dist = np.full(n_stops, inf, dtype=np.int64)
+    pred_stop = np.full(n_stops, -1, dtype=np.int64)
+    pred_trip = np.full(n_stops, -1, dtype=np.int64)
+
+    dist[start_stop_id] = departure_time
+    heap = [(departure_time, start_stop_id)]
+
+    while heap:
+        current_dist, u = heapq.heappop(heap)
+        if current_dist != dist[u]:
+            continue
+        if u == end_stop_id:
+            break
+
+        start = adj_offsets[u]
+        end = adj_offsets[u + 1]
+        for idx in range(start, end):
+            v = adj_neighbors[idx]
+            alt = current_dist + adj_weights[idx]
+            if alt < dist[v]:
+                dist[v] = alt
+                pred_stop[v] = u
+                pred_trip[v] = adj_trip_ids[idx]
+                heapq.heappush(heap, (alt, v))
+
+    return dist, pred_stop, pred_trip
+
+
 @njit(cache=True)
 def run_dijkstra(adj_offsets, adj_neighbors, adj_weights, adj_trip_ids, start_stop_id: int, end_stop_id: int, departure_time: int):
     n_stops = adj_offsets.shape[0] - 1
@@ -93,6 +136,28 @@ def run_dijkstra(adj_offsets, adj_neighbors, adj_weights, adj_trip_ids, start_st
                 pred_trip[v] = adj_trip_ids[idx]
 
     return dist, pred_stop, pred_trip
+
+
+def run_dijkstra_fast(adj_offsets, adj_neighbors, adj_weights, adj_trip_ids, start_stop_id: int, end_stop_id: int, departure_time: int):
+    if _NUMBA_AVAILABLE:
+        return run_dijkstra(
+            adj_offsets,
+            adj_neighbors,
+            adj_weights,
+            adj_trip_ids,
+            start_stop_id,
+            end_stop_id,
+            departure_time,
+        )
+    return _run_dijkstra_heap(
+        adj_offsets,
+        adj_neighbors,
+        adj_weights,
+        adj_trip_ids,
+        start_stop_id,
+        end_stop_id,
+        departure_time,
+    )
 
 
 @njit(cache=True)
@@ -141,6 +206,79 @@ def run_astar(
                 pred_trip[v] = adj_trip_ids[idx]
 
     return dist, pred_stop, pred_trip
+
+
+def _run_astar_heap(
+    adj_offsets,
+    adj_neighbors,
+    adj_weights,
+    adj_trip_ids,
+    start_stop_id: int,
+    end_stop_id: int,
+    departure_time: int,
+    heuristic,
+):
+    n_stops = adj_offsets.shape[0] - 1
+    inf = 2**62
+    dist = np.full(n_stops, inf, dtype=np.int64)
+    pred_stop = np.full(n_stops, -1, dtype=np.int64)
+    pred_trip = np.full(n_stops, -1, dtype=np.int64)
+
+    dist[start_stop_id] = departure_time
+    heap = [(departure_time + int(heuristic[start_stop_id]), departure_time, start_stop_id)]
+
+    while heap:
+        fscore, current_dist, u = heapq.heappop(heap)
+        if current_dist != dist[u]:
+            continue
+        if u == end_stop_id:
+            break
+
+        start = adj_offsets[u]
+        end = adj_offsets[u + 1]
+        for idx in range(start, end):
+            v = adj_neighbors[idx]
+            alt = current_dist + adj_weights[idx]
+            if alt < dist[v]:
+                dist[v] = alt
+                pred_stop[v] = u
+                pred_trip[v] = adj_trip_ids[idx]
+                heapq.heappush(heap, (alt + int(heuristic[v]), alt, v))
+
+    return dist, pred_stop, pred_trip
+
+
+def run_astar_fast(
+    adj_offsets,
+    adj_neighbors,
+    adj_weights,
+    adj_trip_ids,
+    start_stop_id: int,
+    end_stop_id: int,
+    departure_time: int,
+    heuristic,
+):
+    if _NUMBA_AVAILABLE:
+        return run_astar(
+            adj_offsets,
+            adj_neighbors,
+            adj_weights,
+            adj_trip_ids,
+            start_stop_id,
+            end_stop_id,
+            departure_time,
+            heuristic,
+        )
+    return _run_astar_heap(
+        adj_offsets,
+        adj_neighbors,
+        adj_weights,
+        adj_trip_ids,
+        start_stop_id,
+        end_stop_id,
+        departure_time,
+        heuristic,
+    )
 
 
 def build_path(stop_times, trip_offsets, end_stop_id: int, earliest, pred_stop, pred_trip, pred_time):

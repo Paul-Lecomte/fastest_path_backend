@@ -11,7 +11,7 @@ import numpy as np
 
 from .config import setup_logging
 from .loader import NetworkLoader, build_mock_network, TransitNetwork
-from .solver import build_path, build_path_dijkstra, run_dijkstra, run_raptor, run_astar
+from .solver import build_path, build_path_dijkstra, run_dijkstra_fast, run_raptor, run_astar_fast
 
 
 logger = logging.getLogger("pathfinding.http")
@@ -93,7 +93,7 @@ def _compute_segments(
             pred_time,
         )
     if algorithm == "dijkstra":
-        dist, pred_stop, pred_trip = run_dijkstra(
+        dist, pred_stop, pred_trip = run_dijkstra_fast(
             network.adj_offsets,
             network.adj_neighbors,
             network.adj_weights,
@@ -110,7 +110,7 @@ def _compute_segments(
         )
     if algorithm == "astar":
         heuristic = np.zeros(network.adj_offsets.shape[0] - 1, dtype=np.int64)
-        dist, pred_stop, pred_trip = run_astar(
+        dist, pred_stop, pred_trip = run_astar_fast(
             network.adj_offsets,
             network.adj_neighbors,
             network.adj_weights,
