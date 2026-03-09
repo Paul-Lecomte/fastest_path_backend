@@ -66,6 +66,12 @@ def main() -> None:
         run_raptor(
             network.stop_times,
             network.trip_offsets,
+            network.route_stop_offsets,
+            network.route_stops,
+            network.route_trip_offsets,
+            network.route_trips,
+            network.stop_route_offsets,
+            network.stop_routes,
             start_idx,
             end_idx,
             args.departure,
