@@ -11,6 +11,12 @@ def test_smoke_mock_network():
     earliest, pred_stop, pred_trip, pred_time = run_raptor(
         network.stop_times,
         network.trip_offsets,
+        network.route_stop_offsets,
+        network.route_stops,
+        network.route_trip_offsets,
+        network.route_trips,
+        network.stop_route_offsets,
+        network.stop_routes,
         0,
         2,
         900,
