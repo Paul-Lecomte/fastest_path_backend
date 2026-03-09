@@ -6,6 +6,7 @@ import logging
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 
@@ -79,6 +80,12 @@ def _compute_segments(
         earliest, pred_stop, pred_trip, pred_time = run_raptor(
             network.stop_times,
             network.trip_offsets,
+            network.route_stop_offsets,
+            network.route_stops,
+            network.route_trip_offsets,
+            network.route_trips,
+            network.stop_route_offsets,
+            network.stop_routes,
             start_idx,
             end_idx,
             departure_time,
@@ -162,17 +169,22 @@ def build_multi_departure_response(
     departure_time: int,
     offset_minutes: tuple[int, ...] = DEFAULT_OFFSET_MINUTES,
 ) -> dict[str, Any]:
-    options = []
-    for minutes in offset_minutes:
-        offset_departure = departure_time + minutes * 60
-        option = _build_option_response(
-            network,
-            algorithm,
-            start_idx,
-            end_idx,
-            offset_departure,
-        )
-        options.append(option)
+    options = [None] * len(offset_minutes)
+    with ThreadPoolExecutor(max_workers=min(len(offset_minutes), 8)) as pool:
+        futures = {
+            pool.submit(
+                _build_option_response,
+                network,
+                algorithm,
+                start_idx,
+                end_idx,
+                departure_time + minutes * 60,
+            ): idx
+            for idx, minutes in enumerate(offset_minutes)
+        }
+        for future in as_completed(futures):
+            idx = futures[future]
+            options[idx] = future.result()
 
     base = options[0] if options else {
         "departure_time": int(departure_time),
