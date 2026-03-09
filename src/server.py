@@ -41,6 +41,12 @@ class RouteSearchServicer(pathfinding_pb2_grpc.RouteSearchServicer):
             earliest, pred_stop, pred_trip, pred_time = run_raptor(
                 self.network.stop_times,
                 self.network.trip_offsets,
+                self.network.route_stop_offsets,
+                self.network.route_stops,
+                self.network.route_trip_offsets,
+                self.network.route_trips,
+                self.network.stop_route_offsets,
+                self.network.stop_routes,
                 start_stop_id,
                 end_stop_id,
                 request.departure_time,
