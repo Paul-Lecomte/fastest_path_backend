@@ -10,7 +10,7 @@
   <img alt="Tech Stack" src="https://img.shields.io/badge/Numba-00A3E0?logo=python&logoColor=white">
   <img alt="Tech Stack" src="https://img.shields.io/badge/Neo4j-008CC1?logo=neo4j&logoColor=white">
   <img alt="Tech Stack" src="https://img.shields.io/badge/gRPC-3A76F0?logo=google&logoColor=white">
-  <img alt="License" src="https://img.shields.io/github/license/Paul-Lecomte/swiss-pb-map">
+  <img alt="License" src="https://img.shields.io/github/license/Paul-Lecomte/fastest_path_backend">
 </p>
 
 ## What is RAPTOR Pathfinding Microservice?
