@@ -1,6 +1,6 @@
 <!-- PROJECT TITLE & BADGES -->
 <p align="center">
-  <img src="./frontend/public/swisstransitmap_logo.png" alt="FastestPath Logo" width="120" />
+  <img src="./public/fastest_path_logo.png" alt="FastestPath Logo" width="120" />
 </p>
 <h1 align="center">RAPTOR Pathfinding Microservice</h1>
 <p align="center">
