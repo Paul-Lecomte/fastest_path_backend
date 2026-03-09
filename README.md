@@ -1,11 +1,70 @@
-# RAPTOR Pathfinding Microservice (Python)
+<!-- PROJECT TITLE & BADGES -->
+<p align="center">
+  <img src="./frontend/public/swisstransitmap_logo.png" alt="FastestPath Logo" width="120" />
+</p>
+<h1 align="center">RAPTOR Pathfinding Microservice</h1>
+<p align="center">
+  <strong>High-performance transit route planning API (Python, RAPTOR)</strong><br>
+  <img alt="Tech Stack" src="https://img.shields.io/badge/Python-3.13-3776AB?logo=python&logoColor=white">
+  <img alt="Tech Stack" src="https://img.shields.io/badge/NumPy-013243?logo=numpy&logoColor=white">
+  <img alt="Tech Stack" src="https://img.shields.io/badge/Numba-00A3E0?logo=python&logoColor=white">
+  <img alt="Tech Stack" src="https://img.shields.io/badge/Neo4j-008CC1?logo=neo4j&logoColor=white">
+  <img alt="Tech Stack" src="https://img.shields.io/badge/gRPC-3A76F0?logo=google&logoColor=white">
+  <img alt="License" src="https://img.shields.io/github/license/Paul-Lecomte/swiss-pb-map">
+</p>
 
-High-performance pathfinding microservice using:
+## What is RAPTOR Pathfinding Microservice?
 
-- Neo4j for graph storage
-- NumPy for contiguous in-memory arrays
-- Numba to compile the RAPTOR loop
-- gRPC for low-latency communication
+This project provides a high-performance backend service for public transit routing using a RAPTOR-based algorithm.
+It loads GTFS-like data (via Neo4j or a dummy dataset), runs fast earliest-arrival searches, and exposes results via HTTP and gRPC.
+
+---
+
+## Features
+
+- RAPTOR route planning with NumPy-backed arrays
+- Optional Neo4j storage for graph and stop times
+- Numba-accelerated core loop (when available)
+- HTTP endpoint for fastest-path queries
+- Multiple departure options (+10/20/30/40 minutes) computed in parallel
+
+---
+
+## Tech Stack
+
+- Language: Python 3.13
+- Acceleration: NumPy, Numba
+- Storage: Neo4j (optional)
+- APIs: HTTP + gRPC
+
+---
+
+## Project Structure
+
+```bash
+fastest_path_backend/
+├── proto/
+│   └── pathfinding.proto
+├── scripts/
+│   └── bench_pathfinding.py
+├── src/
+│   ├── config.py
+│   ├── http_server.py
+│   ├── loader.py
+│   ├── main.py
+│   ├── pathfinding_pb2.py
+│   ├── pathfinding_pb2_grpc.py
+│   ├── server.py
+│   └── solver.py
+├── tests/
+│   └── test_smoke.py
+├── main.py
+├── requirements.txt
+├── LICENSE
+└── README.md
+```
+
+---
 
 ## HTTP API
 
@@ -45,7 +104,16 @@ Response:
 
 Segments can include multiple trips when a transfer is required.
 
-## Quick start
+---
+
+## Prerequisites
+
+- Python 3.13
+- Optional: Neo4j running locally or remotely
+
+---
+
+## Setup
 
 1) Install dependencies
 
@@ -59,20 +127,13 @@ python -m pip install -r requirements.txt
 python -m grpc_tools.protoc -I proto --python_out=src --grpc_python_out=src proto/pathfinding.proto
 ```
 
-3) Run the server (single command)
+3) Run the server
 
 ```powershell
 python -m src.main
 ```
 
-## Logs
-
-The log level is configured via `LOG_LEVEL` (e.g., `DEBUG`, `INFO`).
-
-## Notes on Numba / Python 3.13
-
-Numba does not yet support Python 3.13. The code runs without Numba (pure Python mode),
-but for JIT acceleration, use Python 3.12 and install `numba`.
+---
 
 ## Configuration
 
@@ -81,12 +142,29 @@ Optional environment variables:
 - `NEO4J_URI` (e.g., `neo4j://127.0.0.1:7687`)
 - `NEO4J_USER`
 - `NEO4J_PASSWORD`
+- `LOG_LEVEL` (e.g., `DEBUG`, `INFO`)
 
 You can also create a `.env` file at the project root containing these variables.
 
 Without Neo4j, the server loads a small dummy network for testing.
-
 Neo4j stop times are parsed from `HH:MM:SS` or numeric values into seconds.
+
+---
+
+## Notes on Numba / Python 3.13
+
+Numba does not yet support Python 3.13. The code runs without Numba (pure Python mode),
+but for JIT acceleration, use Python 3.12 and install `numba`.
+
+---
+
+## Benchmark
+
+```powershell
+python -m scripts.bench_pathfinding --start A --end C --departure 28800 --repeat 3
+```
+
+---
 
 ## Tests
 
@@ -94,34 +172,17 @@ Neo4j stop times are parsed from `HH:MM:SS` or numeric values into seconds.
 python -m pytest -q
 ```
 
-## Test with Postman
+---
 
-- Method: `POST`
-- URL: `http://localhost:8080/path`
-- Body: `raw` -> `JSON`
+## Roadmap
 
-```json
-{
-  "start_stop_id": "A",
-  "end_stop_id": "C",
-  "departure_time": "2026-02-25T08:13:00"
-}
-```
-
-## Test with curl
-
-```powershell
-curl -Method Post -Uri http://localhost:8080/path -ContentType application/json -Body '{"start_stop_id":"A","end_stop_id":"C","departure_time":900}'
-```
-
-## Todo
 - [x] Working RAPTOR implementation with real data from Neo4j
 - [x] Add more detailed logging (e.g., query times, pathfinding times)
-- [ ] Implement the returned data for the frontend and a function to fetch the geometry for the trip
+- [ ] Implement returned data for the frontend and a function to fetch trip geometry
 - [ ] Implement more comprehensive error handling (e.g., invalid input, database errors)
 
-## Benchmark rapide
+---
 
-```powershell
-python -m scripts.bench_pathfinding --start A --end C --departure 28800 --repeat 3
-```
+## License
+
+This project is open source. See the [LICENSE](./LICENSE) file for details.
