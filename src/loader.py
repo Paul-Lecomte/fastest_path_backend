@@ -72,6 +72,12 @@ class TransitNetwork:
     adj_neighbors: np.ndarray
     adj_weights: np.ndarray
     adj_trip_ids: np.ndarray
+    route_stop_offsets: np.ndarray
+    route_stops: np.ndarray
+    route_trip_offsets: np.ndarray
+    route_trips: np.ndarray
+    stop_route_offsets: np.ndarray
+    stop_routes: np.ndarray
 
 
 class NetworkLoader:
@@ -163,6 +169,15 @@ class NetworkLoader:
             stop_times_array, trip_offsets, len(stop_ids)
         )
 
+        (
+            route_stop_offsets,
+            route_stops,
+            route_trip_offsets,
+            route_trips,
+            stop_route_offsets,
+            stop_routes,
+        ) = _build_routes(stop_times_array, trip_offsets, len(stop_ids))
+
         return TransitNetwork(
             stops=stops_array,
             stop_times=stop_times_array,
@@ -176,6 +191,12 @@ class NetworkLoader:
             adj_neighbors=adj_neighbors,
             adj_weights=adj_weights,
             adj_trip_ids=adj_trip_ids,
+            route_stop_offsets=route_stop_offsets,
+            route_stops=route_stops,
+            route_trip_offsets=route_trip_offsets,
+            route_trips=route_trips,
+            stop_route_offsets=stop_route_offsets,
+            stop_routes=stop_routes,
         )
 
 
@@ -222,6 +243,83 @@ def _build_adjacency(stop_times: np.ndarray, trip_offsets: np.ndarray, n_stops: 
     return adj_offsets, adj_neighbors, adj_weights, adj_trip_ids
 
 
+def _build_routes(
+    stop_times: np.ndarray,
+    trip_offsets: np.ndarray,
+    n_stops: int,
+):
+    route_id_by_stops: Dict[Tuple[int, ...], int] = {}
+    route_stops_list: List[List[int]] = []
+    route_trips_list: List[List[int]] = []
+
+    n_trips = int(trip_offsets.shape[0] - 1)
+    for trip_id in range(n_trips):
+        start = int(trip_offsets[trip_id])
+        end = int(trip_offsets[trip_id + 1])
+        if start >= end:
+            continue
+        stops = [int(stop_times[i][0]) for i in range(start, end)]
+        key = tuple(stops)
+        route_id = route_id_by_stops.get(key)
+        if route_id is None:
+            route_id = len(route_stops_list)
+            route_id_by_stops[key] = route_id
+            route_stops_list.append(stops)
+            route_trips_list.append([])
+        route_trips_list[route_id].append(trip_id)
+
+    for route_id, trips in enumerate(route_trips_list):
+        trips.sort(key=lambda trip: int(stop_times[int(trip_offsets[trip])][2]))
+        route_trips_list[route_id] = trips
+
+    total_stops = sum(len(stops) for stops in route_stops_list)
+    route_stop_offsets = np.zeros(len(route_stops_list) + 1, dtype=np.int64)
+    route_stops = np.zeros(total_stops, dtype=np.int32)
+    cursor = 0
+    for route_id, stops in enumerate(route_stops_list):
+        route_stop_offsets[route_id] = cursor
+        for stop_id in stops:
+            route_stops[cursor] = stop_id
+            cursor += 1
+    route_stop_offsets[len(route_stops_list)] = cursor
+
+    total_trips = sum(len(trips) for trips in route_trips_list)
+    route_trip_offsets = np.zeros(len(route_trips_list) + 1, dtype=np.int64)
+    route_trips = np.zeros(total_trips, dtype=np.int32)
+    cursor = 0
+    for route_id, trips in enumerate(route_trips_list):
+        route_trip_offsets[route_id] = cursor
+        for trip_id in trips:
+            route_trips[cursor] = trip_id
+            cursor += 1
+    route_trip_offsets[len(route_trips_list)] = cursor
+
+    stop_routes_list: List[List[int]] = [[] for _ in range(n_stops)]
+    for route_id, stops in enumerate(route_stops_list):
+        for stop_id in stops:
+            stop_routes_list[stop_id].append(route_id)
+
+    total_stop_routes = sum(len(routes) for routes in stop_routes_list)
+    stop_route_offsets = np.zeros(n_stops + 1, dtype=np.int64)
+    stop_routes = np.zeros(total_stop_routes, dtype=np.int32)
+    cursor = 0
+    for stop_id in range(n_stops):
+        stop_route_offsets[stop_id] = cursor
+        for route_id in stop_routes_list[stop_id]:
+            stop_routes[cursor] = route_id
+            cursor += 1
+    stop_route_offsets[n_stops] = cursor
+
+    return (
+        route_stop_offsets,
+        route_stops,
+        route_trip_offsets,
+        route_trips,
+        stop_route_offsets,
+        stop_routes,
+    )
+
+
 def build_mock_network() -> TransitNetwork:
     stop_ids = ["A", "B", "C"]
     trip_ids = ["T1", "T2"]
@@ -252,6 +350,15 @@ def build_mock_network() -> TransitNetwork:
         stop_times_array, trip_offsets, len(stop_ids)
     )
 
+    (
+        route_stop_offsets,
+        route_stops,
+        route_trip_offsets,
+        route_trips,
+        stop_route_offsets,
+        stop_routes,
+    ) = _build_routes(stop_times_array, trip_offsets, len(stop_ids))
+
     return TransitNetwork(
         stops=stops_array,
         stop_times=stop_times_array,
@@ -265,4 +372,10 @@ def build_mock_network() -> TransitNetwork:
         adj_neighbors=adj_neighbors,
         adj_weights=adj_weights,
         adj_trip_ids=adj_trip_ids,
+        route_stop_offsets=route_stop_offsets,
+        route_stops=route_stops,
+        route_trip_offsets=route_trip_offsets,
+        route_trips=route_trips,
+        stop_route_offsets=stop_route_offsets,
+        stop_routes=stop_routes,
     )
