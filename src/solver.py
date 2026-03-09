@@ -18,11 +18,22 @@ except Exception:  # pragma: no cover - fallback when numba is unavailable
 
 
 @njit(cache=True)
-def run_raptor(stop_times, trip_offsets, start_stop_id: int, end_stop_id: int, departure_time: int, max_rounds: int = 6):
-    n_stops = 0
-    for i in range(stop_times.shape[0]):
-        if stop_times[i][0] + 1 > n_stops:
-            n_stops = stop_times[i][0] + 1
+def run_raptor(
+    stop_times,
+    trip_offsets,
+    route_stop_offsets,
+    route_stops,
+    route_trip_offsets,
+    route_trips,
+    stop_route_offsets,
+    stop_routes,
+    start_stop_id: int,
+    end_stop_id: int,
+    departure_time: int,
+    max_rounds: int = 6,
+):
+    n_stops = stop_route_offsets.shape[0] - 1
+    n_routes = route_stop_offsets.shape[0] - 1
 
     inf = np.int64(2**62)
     earliest = np.full(n_stops, inf, dtype=np.int64)
@@ -30,35 +41,82 @@ def run_raptor(stop_times, trip_offsets, start_stop_id: int, end_stop_id: int, d
     pred_trip = np.full(n_stops, -1, dtype=np.int64)
     pred_time = np.full(n_stops, -1, dtype=np.int64)
 
+    marked = np.zeros(n_stops, dtype=np.uint8)
+    new_marked = np.zeros(n_stops, dtype=np.uint8)
+    route_marked = np.zeros(n_routes, dtype=np.uint8)
+
     earliest[start_stop_id] = departure_time
+    marked[start_stop_id] = 1
+
+    best_target = inf
 
     for _round in range(max_rounds):
+        for stop_id in range(n_stops):
+            if marked[stop_id] == 0:
+                continue
+            start = stop_route_offsets[stop_id]
+            end = stop_route_offsets[stop_id + 1]
+            for idx in range(start, end):
+                route_id = stop_routes[idx]
+                route_marked[route_id] = 1
+
         improved = False
-        for trip_id in range(trip_offsets.shape[0] - 1):
-            start = trip_offsets[trip_id]
-            end = trip_offsets[trip_id + 1]
-            if start >= end:
+        for route_id in range(n_routes):
+            if route_marked[route_id] == 0:
+                continue
+            route_marked[route_id] = 0
+
+            r_start = route_stop_offsets[route_id]
+            r_end = route_stop_offsets[route_id + 1]
+            t_start = route_trip_offsets[route_id]
+            t_end = route_trip_offsets[route_id + 1]
+            if r_start >= r_end or t_start >= t_end:
                 continue
 
-            boarded = False
-            for i in range(start, end):
-                stop_id = stop_times[i][0]
-                arrival_time = stop_times[i][2]
-                if not boarded:
-                    if earliest[stop_id] <= arrival_time:
-                        boarded = True
+            current_trip_idx = -1
+            for s_idx in range(r_end - r_start):
+                stop_id = route_stops[r_start + s_idx]
+
+                if marked[stop_id] != 0:
+                    if best_target != inf and earliest[stop_id] >= best_target:
+                        pass
                     else:
-                        continue
+                        if current_trip_idx == -1:
+                            cand_idx = t_start
+                            while cand_idx < t_end:
+                                trip_id = route_trips[cand_idx]
+                                st_idx = trip_offsets[trip_id] + s_idx
+                                if stop_times[st_idx][2] >= earliest[stop_id]:
+                                    current_trip_idx = cand_idx
+                                    break
+                                cand_idx += 1
+
+                if current_trip_idx == -1:
+                    continue
+
+                trip_id = route_trips[current_trip_idx]
+                st_idx = trip_offsets[trip_id] + s_idx
+                arrival_time = stop_times[st_idx][2]
+
+                if best_target != inf and arrival_time >= best_target:
+                    break
 
                 if arrival_time < earliest[stop_id]:
                     earliest[stop_id] = arrival_time
-                    pred_stop[stop_id] = stop_times[i - 1][0] if i > start else stop_id
+                    pred_stop[stop_id] = route_stops[r_start + s_idx - 1] if s_idx > 0 else stop_id
                     pred_trip[stop_id] = trip_id
                     pred_time[stop_id] = arrival_time
+                    new_marked[stop_id] = 1
                     improved = True
+                    if stop_id == end_stop_id:
+                        best_target = arrival_time
 
         if not improved:
             break
+
+        for stop_id in range(n_stops):
+            marked[stop_id] = new_marked[stop_id]
+            new_marked[stop_id] = 0
 
     return earliest, pred_stop, pred_trip, pred_time
 
