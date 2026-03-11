@@ -1,4 +1,5 @@
 # A gRPC server that provides a route search service using the pathfinding algorithms implemented in solver.py.
+# The server loads the transit network data from a Neo4j database using the NetworkLoader class, and falls back to a mock network if the database load fails. The gRPC service defines a GetFastestPath method that accepts a PathRequest and returns a PathResponse containing the fastest path segments between the specified start and end stops at the given departure time, using the requested algorithm (RAPTOR, Dijkstra, or A*).
 from __future__ import annotations
 
 import asyncio
