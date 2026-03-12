@@ -1,4 +1,5 @@
 # This module implements the core algorithms for route planning, including RAPTOR, Dijkstra's algorithm, and A* search.
+# The RAPTOR algorithm is implemented in the run_raptor function, which computes the earliest arrival times at each stop given a departure time and a transit network. The Dijkstra and A* algorithms are implemented in the run_dijkstra and run_astar functions, respectively, which compute the shortest path in a graph representation of the transit network. The build_path and build_path_dijkstra functions reconstruct the path from the predecessor information computed by the algorithms.
 from __future__ import annotations
 
 import numpy as np
