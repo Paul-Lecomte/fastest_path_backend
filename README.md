@@ -180,7 +180,6 @@ python -m pytest -q
 - [x] Add more detailed logging (e.g., query times, pathfinding times)
 - [ ] Implement returned data for the frontend and a function to fetch trip geometry
 - [ ] Implement more comprehensive error handling (e.g., invalid input, database errors)
-
 ---
 
 ## License
