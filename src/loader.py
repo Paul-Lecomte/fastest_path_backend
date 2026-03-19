@@ -66,6 +66,8 @@ class TransitNetwork:
     stop_id_index: Dict[str, int]
     trip_id_index: Dict[str, int]
     stop_ids: List[str]
+    stop_lats: np.ndarray
+    stop_lons: np.ndarray
     trip_ids: List[str]
     trip_offsets: np.ndarray
     adj_offsets: np.ndarray
@@ -93,13 +95,16 @@ class NetworkLoader:
             "MATCH (st)-[:PART_OF_TRIP]->(t:Trip) "
             "RETURN s.stop_id AS stop_id, t.trip_id AS trip_id, "
             "coalesce(st.arrival_time, st.departure_time) AS arrival_time, "
-            "st.stop_sequence AS stop_sequence"
+            "st.stop_sequence AS stop_sequence, "
+            "coalesce(s.stop_lat, s.latitude, s.lat) AS stop_lat, "
+            "coalesce(s.stop_lon, s.longitude, s.lon) AS stop_lon"
         )
 
         stop_ids: List[str] = []
         trip_ids: List[str] = []
         stop_id_index: Dict[str, int] = {}
         trip_id_index: Dict[str, int] = {}
+        stop_coords: Dict[int, Tuple[float, float]] = {}
         rows: List[Tuple[int, int, int, int]] = []
 
         with self.driver.session() as session:
@@ -109,6 +114,8 @@ class NetworkLoader:
                 trip_id = record["trip_id"]
                 arrival_time = record["arrival_time"]
                 stop_sequence = record["stop_sequence"]
+                stop_lat = record["stop_lat"]
+                stop_lon = record["stop_lon"]
                 if arrival_time is None or stop_sequence is None:
                     continue
                 try:
@@ -132,6 +139,13 @@ class NetworkLoader:
                     trip_id_index[trip_id] = len(trip_ids)
                     trip_ids.append(trip_id)
 
+                stop_index = stop_id_index[stop_id]
+                if stop_index not in stop_coords and stop_lat is not None and stop_lon is not None:
+                    try:
+                        stop_coords[stop_index] = (float(stop_lat), float(stop_lon))
+                    except (TypeError, ValueError):
+                        pass
+
                 rows.append(
                     (
                         stop_id_index[stop_id],
@@ -146,6 +160,12 @@ class NetworkLoader:
         stops_array = np.zeros(len(stop_ids), dtype=STOPS_DTYPE)
         for i, _ in enumerate(stop_ids):
             stops_array[i] = (i, i)
+
+        stop_lats = np.full(len(stop_ids), np.nan, dtype=np.float64)
+        stop_lons = np.full(len(stop_ids), np.nan, dtype=np.float64)
+        for stop_index, (lat, lon) in stop_coords.items():
+            stop_lats[stop_index] = lat
+            stop_lons[stop_index] = lon
 
         stop_times_array = np.zeros(len(rows), dtype=STOP_TIMES_DTYPE)
         for i, (stop_id, trip_id, arrival_time, stop_sequence) in enumerate(rows):
@@ -185,6 +205,8 @@ class NetworkLoader:
             stop_id_index=stop_id_index,
             trip_id_index=trip_id_index,
             stop_ids=stop_ids,
+            stop_lats=stop_lats,
+            stop_lons=stop_lons,
             trip_ids=trip_ids,
             trip_offsets=trip_offsets,
             adj_offsets=adj_offsets,
@@ -343,6 +365,8 @@ def build_mock_network() -> TransitNetwork:
     routes_array[1] = (1, 1)
 
     stop_id_index = {"A": 0, "B": 1, "C": 2}
+    stop_lats = np.array([48.8566, 48.8570, 48.8574], dtype=np.float64)
+    stop_lons = np.array([2.3522, 2.3530, 2.3540], dtype=np.float64)
     trip_id_index = {"T1": 0, "T2": 1}
     trip_offsets = np.array([0, 2, 4], dtype=np.int64)
 
@@ -366,6 +390,8 @@ def build_mock_network() -> TransitNetwork:
         stop_id_index=stop_id_index,
         trip_id_index=trip_id_index,
         stop_ids=stop_ids,
+        stop_lats=stop_lats,
+        stop_lons=stop_lons,
         trip_ids=trip_ids,
         trip_offsets=trip_offsets,
         adj_offsets=adj_offsets,
