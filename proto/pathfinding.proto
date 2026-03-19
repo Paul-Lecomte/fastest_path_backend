@@ -10,6 +10,7 @@ message PathRequest {
   string start_stop_id = 1;
   string end_stop_id = 2;
   int64 departure_time = 3; // Unix timestamp
+  repeated string start_stop_ids = 4;
 }
 
 message Path {
