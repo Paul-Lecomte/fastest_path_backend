@@ -71,7 +71,9 @@ fastest_path_backend/
 Single endpoint:
 
 - `POST /path`
-- JSON body: `{"start_stop_id":"A","end_stop_id":"C","departure_time":900}`
+- JSON body (single start): `{"start_stop_id":"A","end_stop_id":"C","departure_time":900}`
+- JSON body (multiple starts): `{"start_stop_ids":["A","B"],"end_stop_id":"C","departure_time":900}`
+- JSON body (GPS origin): `{"origin":{"lat":48.8566,"lon":2.3522,"radius_m":1000,"max_candidates":12},"end_stop_id":"C","departure_time":900}`
 
 Response:
 
@@ -103,6 +105,23 @@ Response:
 ```
 
 Segments can include multiple trips when a transfer is required.
+When `start_stop_ids` is provided, all starts are evaluated and the fastest resulting path is returned.
+When `origin` is provided, nearby stops are selected automatically and scored with walking access time.
+If no RAPTOR path is found, the HTTP endpoint retries with Dijkstra and expanded nearby start stops to improve route discovery.
+
+## gRPC API
+
+`PathRequest` now supports either a single start stop (`start_stop_id`) or multiple start stops (`start_stop_ids`).
+When `start_stop_ids` is provided, the server evaluates all starts in parallel and returns the fastest resulting path.
+
+```proto
+message PathRequest {
+  string start_stop_id = 1;
+  string end_stop_id = 2;
+  int64 departure_time = 3;
+  repeated string start_stop_ids = 4;
+}
+```
 
 ---
 
