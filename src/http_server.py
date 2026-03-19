@@ -18,6 +18,11 @@ from .solver import build_path, build_path_dijkstra, run_dijkstra_fast, run_rapt
 logger = logging.getLogger("pathfinding.http")
 
 DEFAULT_OFFSET_MINUTES = (0, 10, 20, 30, 40)
+DEFAULT_START_EXPANSION_HOPS = 2
+DEFAULT_START_EXPANSION_MAX_STOPS = 256
+DEFAULT_ORIGIN_RADIUS_M = 1000.0
+DEFAULT_ORIGIN_MAX_CANDIDATES = 12
+DEFAULT_WALK_SPEED_MPS = 1.4
 
 
 def _count_transfers(segments) -> int:
@@ -39,12 +44,105 @@ def _departure_to_seconds(value: Any) -> int | None:
         return int(value)
     if isinstance(value, str):
         text = value.strip()
+        if text.isdigit() or (text.startswith("-") and text[1:].isdigit()):
+            return int(text)
         try:
             parsed = datetime.fromisoformat(text)
         except ValueError:
             return None
         return parsed.hour * 3600 + parsed.minute * 60 + parsed.second
     return None
+
+
+def _to_float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _haversine_distance_m(lat1: float, lon1: float, lat2: np.ndarray, lon2: np.ndarray) -> np.ndarray:
+    radius_earth_m = 6371000.0
+    phi1 = np.radians(lat1)
+    phi2 = np.radians(lat2)
+    dphi = np.radians(lat2 - lat1)
+    dlambda = np.radians(lon2 - lon1)
+
+    sin_half_dphi = np.sin(dphi / 2.0)
+    sin_half_dlambda = np.sin(dlambda / 2.0)
+    a = sin_half_dphi * sin_half_dphi + np.cos(phi1) * np.cos(phi2) * sin_half_dlambda * sin_half_dlambda
+    c = 2.0 * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a))
+    return radius_earth_m * c
+
+
+def _select_starts_from_origin(network: TransitNetwork, origin: Any):
+    if not isinstance(origin, dict):
+        return [], {}, "invalid_origin"
+
+    lat = _to_float(origin.get("lat"))
+    lon = _to_float(origin.get("lon"))
+    if lat is None or lon is None:
+        return [], {}, "invalid_origin"
+
+    radius_m = float(origin.get("radius_m", DEFAULT_ORIGIN_RADIUS_M))
+    if radius_m <= 0:
+        radius_m = DEFAULT_ORIGIN_RADIUS_M
+
+    max_candidates = _to_int(origin.get("max_candidates"), DEFAULT_ORIGIN_MAX_CANDIDATES)
+    if max_candidates <= 0:
+        max_candidates = DEFAULT_ORIGIN_MAX_CANDIDATES
+
+    walk_speed_mps = float(origin.get("walk_speed_mps", DEFAULT_WALK_SPEED_MPS))
+    if walk_speed_mps <= 0:
+        walk_speed_mps = DEFAULT_WALK_SPEED_MPS
+
+    valid_mask = np.isfinite(network.stop_lats) & np.isfinite(network.stop_lons)
+    valid_indices = np.where(valid_mask)[0]
+    if valid_indices.size == 0:
+        return [], {}, "missing_stop_coordinates"
+
+    distances = _haversine_distance_m(
+        lat,
+        lon,
+        network.stop_lats[valid_indices],
+        network.stop_lons[valid_indices],
+    )
+    order = np.argsort(distances)
+    sorted_indices = valid_indices[order]
+    sorted_distances = distances[order]
+
+    within_radius = sorted_distances <= radius_m
+    if np.any(within_radius):
+        selected_indices = sorted_indices[within_radius][:max_candidates]
+        selected_distances = sorted_distances[within_radius][:max_candidates]
+    else:
+        fallback_count = min(max_candidates, sorted_indices.size)
+        selected_indices = sorted_indices[:fallback_count]
+        selected_distances = sorted_distances[:fallback_count]
+
+    start_indices = [int(value) for value in selected_indices.tolist()]
+    start_penalties = {
+        int(stop_idx): int(distance_m / walk_speed_mps)
+        for stop_idx, distance_m in zip(selected_indices, selected_distances)
+    }
+
+    metadata = {
+        "origin": {
+            "lat": float(lat),
+            "lon": float(lon),
+            "radius_m": float(radius_m),
+            "max_candidates": int(max_candidates),
+        },
+        "candidate_start_count": len(start_indices),
+    }
+    return start_indices, start_penalties, metadata
 
 
 def load_network() -> TransitNetwork:
@@ -136,20 +234,175 @@ def _compute_segments(
     return None
 
 
+def _get_incoming_neighbors(network: TransitNetwork) -> list[set[int]]:
+    cached = getattr(network, "_incoming_neighbors", None)
+    if cached is not None:
+        return cached
+
+    n_stops = int(network.adj_offsets.shape[0] - 1)
+    incoming = [set() for _ in range(n_stops)]
+    for source_stop in range(n_stops):
+        row_start = int(network.adj_offsets[source_stop])
+        row_end = int(network.adj_offsets[source_stop + 1])
+        for idx in range(row_start, row_end):
+            target_stop = int(network.adj_neighbors[idx])
+            incoming[target_stop].add(source_stop)
+
+    setattr(network, "_incoming_neighbors", incoming)
+    return incoming
+
+
+def _expand_start_indices(
+    network: TransitNetwork,
+    start_indices: list[int],
+    max_hops: int = DEFAULT_START_EXPANSION_HOPS,
+    max_stops: int = DEFAULT_START_EXPANSION_MAX_STOPS,
+) -> list[int]:
+    if not start_indices:
+        return []
+
+    incoming_neighbors = _get_incoming_neighbors(network)
+    expanded = list(dict.fromkeys(start_indices))
+    visited = set(expanded)
+    frontier = expanded[:]
+
+    for _ in range(max_hops):
+        if not frontier or len(expanded) >= max_stops:
+            break
+        next_frontier = []
+        for stop_id in frontier:
+            row_start = int(network.adj_offsets[stop_id])
+            row_end = int(network.adj_offsets[stop_id + 1])
+            for idx in range(row_start, row_end):
+                neighbor = int(network.adj_neighbors[idx])
+                if neighbor in visited:
+                    continue
+                visited.add(neighbor)
+                expanded.append(neighbor)
+                next_frontier.append(neighbor)
+                if len(expanded) >= max_stops:
+                    break
+            if len(expanded) >= max_stops:
+                break
+
+            for neighbor in incoming_neighbors[stop_id]:
+                if neighbor in visited:
+                    continue
+                visited.add(neighbor)
+                expanded.append(neighbor)
+                next_frontier.append(neighbor)
+                if len(expanded) >= max_stops:
+                    break
+            if len(expanded) >= max_stops:
+                break
+
+        frontier = next_frontier
+
+    return expanded
+
+
+def _find_best_segments_for_starts(
+    network: TransitNetwork,
+    algorithm: str,
+    start_indices: list[int],
+    end_idx: int,
+    departure_time: int,
+    start_penalties: dict[int, int] | None = None,
+):
+    if len(start_indices) == 1:
+        only_start = start_indices[0]
+        segments = _compute_segments(network, algorithm, only_start, end_idx, departure_time)
+        if not segments:
+            return [], None, None
+        penalty = 0 if start_penalties is None else int(start_penalties.get(only_start, 0))
+        score = int(segments[-1][2]) + penalty
+        return segments, only_start, score
+
+    with ThreadPoolExecutor(max_workers=min(len(start_indices), 16)) as pool:
+        futures = [
+            pool.submit(
+                _compute_segments,
+                network,
+                algorithm,
+                start_idx,
+                end_idx,
+                departure_time,
+            )
+            for start_idx in start_indices
+        ]
+        results = [future.result() for future in futures]
+
+    best_segments = []
+    best_start = None
+    best_score = None
+    for start_idx, result in zip(start_indices, results):
+        if not result:
+            continue
+        penalty = 0 if start_penalties is None else int(start_penalties.get(start_idx, 0))
+        score = int(result[-1][2]) + penalty
+        if best_score is None or score < best_score:
+            best_score = score
+            best_segments = result
+            best_start = int(start_idx)
+    return best_segments, best_start, best_score
+
+
 def _build_option_response(
     network: TransitNetwork,
     algorithm: str,
-    start_idx: int,
+    start_indices: list[int],
     end_idx: int,
     departure_time: int,
+    start_penalties: dict[int, int] | None = None,
 ) -> dict[str, Any]:
-    segments = _compute_segments(network, algorithm, start_idx, end_idx, departure_time)
+    algorithms = [algorithm]
+    if algorithm == "raptor":
+        algorithms.append("dijkstra")
+
+    segments = []
+    best_start = None
+    for selected_algorithm in algorithms:
+        segments, best_start, _ = _find_best_segments_for_starts(
+            network,
+            selected_algorithm,
+            start_indices,
+            end_idx,
+            departure_time,
+            start_penalties,
+        )
+        if segments:
+            break
+
+    if not segments:
+        expanded_start_indices = _expand_start_indices(network, start_indices)
+        if len(expanded_start_indices) > len(start_indices):
+            for selected_algorithm in algorithms:
+                segments, best_start, _ = _find_best_segments_for_starts(
+                    network,
+                    selected_algorithm,
+                    expanded_start_indices,
+                    end_idx,
+                    departure_time,
+                    start_penalties,
+                )
+                if segments:
+                    logger.info(
+                        "Route fallback used algorithm=%s start_expansion=%s original_starts=%s",
+                        selected_algorithm,
+                        len(expanded_start_indices),
+                        len(start_indices),
+                    )
+                    break
+                
+
     if segments is None:
         return {}
     return {
         "departure_time": int(departure_time),
         "transfers": _count_transfers(segments),
         "duration_seconds": int(segments[-1][2] - departure_time) if segments else None,
+        "start_stop_id": network.stop_ids[best_start] if best_start is not None else None,
+        "access_walk_seconds": int(start_penalties.get(best_start, 0)) if (best_start is not None and start_penalties) else 0,
         "segments": [
             {
                 "trip_id": network.trip_ids[trip_id],
@@ -164,10 +417,12 @@ def _build_option_response(
 def build_multi_departure_response(
     network: TransitNetwork,
     algorithm: str,
-    start_idx: int,
+    start_indices: list[int],
     end_idx: int,
     departure_time: int,
     offset_minutes: tuple[int, ...] = DEFAULT_OFFSET_MINUTES,
+    start_penalties: dict[int, int] | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     options = [None] * len(offset_minutes)
     with ThreadPoolExecutor(max_workers=min(len(offset_minutes), 8)) as pool:
@@ -176,9 +431,10 @@ def build_multi_departure_response(
                 _build_option_response,
                 network,
                 algorithm,
-                start_idx,
+                start_indices,
                 end_idx,
                 departure_time + minutes * 60,
+                start_penalties,
             ): idx
             for idx, minutes in enumerate(offset_minutes)
         }
@@ -194,8 +450,12 @@ def build_multi_departure_response(
     }
     return {
         "algorithm": algorithm,
+        "candidate_start_count": len(start_indices),
+        **(metadata or {}),
         "transfers": base.get("transfers"),
         "duration_seconds": base.get("duration_seconds"),
+        "start_stop_id": base.get("start_stop_id"),
+        "access_walk_seconds": base.get("access_walk_seconds"),
         "segments": base.get("segments"),
         "options": options,
     }
@@ -214,11 +474,23 @@ class PathRequestHandler(BaseHTTPRequestHandler):
             return
 
         start_stop_id = payload.get("start_stop_id")
+        start_stop_ids = payload.get("start_stop_ids")
+        origin = payload.get("origin")
         end_stop_id = payload.get("end_stop_id")
         departure_raw = payload.get("departure_time")
         algorithm = payload.get("algorithm", "raptor")
 
-        if not isinstance(start_stop_id, str) or not isinstance(end_stop_id, str):
+        normalized_start_stop_ids = []
+        if isinstance(start_stop_ids, list):
+            normalized_start_stop_ids = [
+                stop_id.strip()
+                for stop_id in start_stop_ids
+                if isinstance(stop_id, str) and stop_id.strip()
+            ]
+        if not normalized_start_stop_ids and isinstance(start_stop_id, str) and start_stop_id.strip():
+            normalized_start_stop_ids = [start_stop_id.strip()]
+
+        if (not normalized_start_stop_ids and origin is None) or not isinstance(end_stop_id, str):
             self._send_json(400, {"error": "invalid_stop_id"})
             return
 
@@ -236,9 +508,28 @@ class PathRequestHandler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": "network_not_loaded"})
             return
 
-        start_idx = self.network.stop_id_index.get(start_stop_id)
+        metadata = None
+        start_penalties = None
+        if origin is not None:
+            start_indices, start_penalties, origin_result = _select_starts_from_origin(self.network, origin)
+            if not start_indices:
+                error_code = origin_result if isinstance(origin_result, str) else "invalid_origin"
+                self._send_json(400, {"error": error_code})
+                return
+            if isinstance(origin_result, dict):
+                metadata = origin_result
+        else:
+            start_indices = []
+            for stop_id in normalized_start_stop_ids:
+                stop_index = self.network.stop_id_index.get(stop_id)
+                if stop_index is None:
+                    self._send_json(404, {"error": "unknown_stop_id"})
+                    return
+                start_indices.append(stop_index)
+
+            start_indices = list(dict.fromkeys(start_indices))
         end_idx = self.network.stop_id_index.get(end_stop_id)
-        if start_idx is None or end_idx is None:
+        if end_idx is None:
             self._send_json(404, {"error": "unknown_stop_id"})
             return
 
@@ -249,14 +540,16 @@ class PathRequestHandler(BaseHTTPRequestHandler):
         response = build_multi_departure_response(
             self.network,
             algorithm,
-            start_idx,
+            start_indices,
             end_idx,
             departure_time,
+            start_penalties=start_penalties,
+            metadata=metadata,
         )
         logger.info(
-            "HTTP /path algorithm=%s start=%s end=%s departure=%s options=%s",
+            "HTTP /path algorithm=%s starts=%s end=%s departure=%s options=%s",
             algorithm,
-            start_stop_id,
+            len(start_indices),
             end_stop_id,
             departure_time,
             len(response.get("options", [])),
