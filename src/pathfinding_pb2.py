@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x11pathfinding.proto\x12\x0bpathfinding\"Q\n\x0bPathRequest\x12\x15\n\rstart_stop_id\x18\x01 \x01(\t\x12\x13\n\x0b\x65nd_stop_id\x18\x02 \x01(\t\x12\x16\n\x0e\x64\x65parture_time\x18\x03 \x01(\x03\">\n\x04Path\x12\x0f\n\x07trip_id\x18\x01 \x01(\t\x12\x0f\n\x07stop_id\x18\x02 \x01(\t\x12\x14\n\x0c\x61rrival_time\x18\x03 \x01(\x03\"3\n\x0cPathResponse\x12#\n\x08segments\x18\x01 \x03(\x0b\x32\x11.pathfinding.Path2V\n\x0bRouteSearch\x12G\n\x0eGetFastestPath\x12\x18.pathfinding.PathRequest\x1a\x19.pathfinding.PathResponse\"\x00\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x11pathfinding.proto\x12\x0bpathfinding\"i\n\x0bPathRequest\x12\x15\n\rstart_stop_id\x18\x01 \x01(\t\x12\x13\n\x0b\x65nd_stop_id\x18\x02 \x01(\t\x12\x16\n\x0e\x64\x65parture_time\x18\x03 \x01(\x03\x12\x16\n\x0estart_stop_ids\x18\x04 \x03(\t\">\n\x04Path\x12\x0f\n\x07trip_id\x18\x01 \x01(\t\x12\x0f\n\x07stop_id\x18\x02 \x01(\t\x12\x14\n\x0c\x61rrival_time\x18\x03 \x01(\x03\"3\n\x0cPathResponse\x12#\n\x08segments\x18\x01 \x03(\x0b\x32\x11.pathfinding.Path2V\n\x0bRouteSearch\x12G\n\x0eGetFastestPath\x12\x18.pathfinding.PathRequest\x1a\x19.pathfinding.PathResponse\"\x00\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -32,11 +32,11 @@ _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'pathfinding_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
   _globals['_PATHREQUEST']._serialized_start=34
-  _globals['_PATHREQUEST']._serialized_end=115
-  _globals['_PATH']._serialized_start=117
-  _globals['_PATH']._serialized_end=179
-  _globals['_PATHRESPONSE']._serialized_start=181
-  _globals['_PATHRESPONSE']._serialized_end=232
-  _globals['_ROUTESEARCH']._serialized_start=234
-  _globals['_ROUTESEARCH']._serialized_end=320
+  _globals['_PATHREQUEST']._serialized_end=139
+  _globals['_PATH']._serialized_start=141
+  _globals['_PATH']._serialized_end=203
+  _globals['_PATHRESPONSE']._serialized_start=205
+  _globals['_PATHRESPONSE']._serialized_end=256
+  _globals['_ROUTESEARCH']._serialized_start=258
+  _globals['_ROUTESEARCH']._serialized_end=344
 # @@protoc_insertion_point(module_scope)
