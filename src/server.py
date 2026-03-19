@@ -17,6 +17,116 @@ from .solver import build_path, build_path_dijkstra, run_dijkstra_fast, run_rapt
 
 logger = logging.getLogger("pathfinding.server")
 
+SUPPORTED_ALGORITHMS = {"raptor", "dijkstra", "astar"}
+
+
+def _compute_segments(network, algorithm: str, start_stop_id: int, end_stop_id: int, departure_time: int):
+    if algorithm == "raptor":
+        earliest, pred_stop, pred_trip, pred_time = run_raptor(
+            network.stop_times,
+            network.trip_offsets,
+            network.route_stop_offsets,
+            network.route_stops,
+            network.route_trip_offsets,
+            network.route_trips,
+            network.stop_route_offsets,
+            network.stop_routes,
+            start_stop_id,
+            end_stop_id,
+            departure_time,
+        )
+
+        return build_path(
+            network.stop_times,
+            network.trip_offsets,
+            end_stop_id,
+            earliest,
+            pred_stop,
+            pred_trip,
+            pred_time,
+        )
+    if algorithm == "dijkstra":
+        dist, pred_stop, pred_trip = run_dijkstra_fast(
+            network.adj_offsets,
+            network.adj_neighbors,
+            network.adj_weights,
+            network.adj_trip_ids,
+            start_stop_id,
+            end_stop_id,
+            departure_time,
+        )
+        return build_path_dijkstra(
+            end_stop_id,
+            dist,
+            pred_stop,
+            pred_trip,
+        )
+    heuristic = np.zeros(network.adj_offsets.shape[0] - 1, dtype=np.int64)
+    dist, pred_stop, pred_trip = run_astar_fast(
+        network.adj_offsets,
+        network.adj_neighbors,
+        network.adj_weights,
+        network.adj_trip_ids,
+        start_stop_id,
+        end_stop_id,
+        departure_time,
+        heuristic,
+    )
+    return build_path_dijkstra(
+        end_stop_id,
+        dist,
+        pred_stop,
+        pred_trip,
+    )
+
+
+def _get_start_stop_ids(request) -> list[str]:
+    start_stop_ids = [stop_id.strip() for stop_id in getattr(request, "start_stop_ids", []) if stop_id and stop_id.strip()]
+    if not start_stop_ids:
+        single_start = getattr(request, "start_stop_id", "")
+        if single_start and single_start.strip():
+            start_stop_ids = [single_start.strip()]
+
+    unique_start_stop_ids = []
+    seen = set()
+    for stop_id in start_stop_ids:
+        if stop_id in seen:
+            continue
+        seen.add(stop_id)
+        unique_start_stop_ids.append(stop_id)
+    return unique_start_stop_ids
+
+
+async def _find_fastest_segments_parallel(network, algorithm: str, start_stop_ids: list[int], end_stop_id: int, departure_time: int):
+    if len(start_stop_ids) == 1:
+        return _compute_segments(network, algorithm, start_stop_ids[0], end_stop_id, departure_time)
+
+    loop = asyncio.get_running_loop()
+    tasks = [
+        loop.run_in_executor(
+            None,
+            _compute_segments,
+            network,
+            algorithm,
+            start_stop_id,
+            end_stop_id,
+            departure_time,
+        )
+        for start_stop_id in start_stop_ids
+    ]
+    results = await asyncio.gather(*tasks)
+
+    best_segments = []
+    best_arrival = None
+    for segments in results:
+        if not segments:
+            continue
+        arrival_time = int(segments[-1][2])
+        if best_arrival is None or arrival_time < best_arrival:
+            best_arrival = arrival_time
+            best_segments = segments
+    return best_segments
+
 
 class RouteSearchServicer(pathfinding_pb2_grpc.RouteSearchServicer):
     def __init__(self, network):
@@ -24,80 +134,42 @@ class RouteSearchServicer(pathfinding_pb2_grpc.RouteSearchServicer):
 
     async def GetFastestPath(self, request, context):
         logger.info(
-            "GetFastestPath request start=%s end=%s departure=%s",
+            "GetFastestPath request start=%s starts=%s end=%s departure=%s",
             request.start_stop_id,
+            len(getattr(request, "start_stop_ids", [])),
             request.end_stop_id,
             request.departure_time,
         )
-        start_stop_id = self.network.stop_id_index.get(request.start_stop_id)
-        end_stop_id = self.network.stop_id_index.get(request.end_stop_id)
-
-        if start_stop_id is None or end_stop_id is None:
-            await context.abort(grpc.StatusCode.NOT_FOUND, "Unknown stop_id")
 
         algorithm = getattr(request, "algorithm", "raptor") or "raptor"
         algorithm = algorithm.strip().lower()
-
-        if algorithm == "raptor":
-            earliest, pred_stop, pred_trip, pred_time = run_raptor(
-                self.network.stop_times,
-                self.network.trip_offsets,
-                self.network.route_stop_offsets,
-                self.network.route_stops,
-                self.network.route_trip_offsets,
-                self.network.route_trips,
-                self.network.stop_route_offsets,
-                self.network.stop_routes,
-                start_stop_id,
-                end_stop_id,
-                request.departure_time,
-            )
-
-            segments = build_path(
-                self.network.stop_times,
-                self.network.trip_offsets,
-                end_stop_id,
-                earliest,
-                pred_stop,
-                pred_trip,
-                pred_time,
-            )
-        elif algorithm == "dijkstra":
-            dist, pred_stop, pred_trip = run_dijkstra_fast(
-                self.network.adj_offsets,
-                self.network.adj_neighbors,
-                self.network.adj_weights,
-                self.network.adj_trip_ids,
-                start_stop_id,
-                end_stop_id,
-                request.departure_time,
-            )
-            segments = build_path_dijkstra(
-                end_stop_id,
-                dist,
-                pred_stop,
-                pred_trip,
-            )
-        elif algorithm == "astar":
-            heuristic = np.zeros(self.network.adj_offsets.shape[0] - 1, dtype=np.int64)
-            dist, pred_stop, pred_trip = run_astar_fast(
-                self.network.adj_offsets,
-                self.network.adj_neighbors,
-                self.network.adj_weights,
-                self.network.adj_trip_ids,
-                start_stop_id,
-                end_stop_id,
-                request.departure_time,
-                heuristic,
-            )
-            segments = build_path_dijkstra(
-                end_stop_id,
-                dist,
-                pred_stop,
-                pred_trip,
-            )
-        else:
+        if algorithm not in SUPPORTED_ALGORITHMS:
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Unsupported algorithm")
+
+        request_start_stop_ids = _get_start_stop_ids(request)
+        if not request_start_stop_ids:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Missing start_stop_id or start_stop_ids")
+
+        start_stop_ids = []
+        unknown_stops = []
+        for stop_id in request_start_stop_ids:
+            start_stop_id = self.network.stop_id_index.get(stop_id)
+            if start_stop_id is None:
+                unknown_stops.append(stop_id)
+                continue
+            start_stop_ids.append(start_stop_id)
+
+        end_stop_id = self.network.stop_id_index.get(request.end_stop_id)
+        if unknown_stops or end_stop_id is None:
+            await context.abort(grpc.StatusCode.NOT_FOUND, "Unknown stop_id")
+
+        segments = await _find_fastest_segments_parallel(
+            self.network,
+            algorithm,
+            start_stop_ids,
+            end_stop_id,
+            request.departure_time,
+        )
 
         response = pathfinding_pb2.PathResponse()
         for trip_id, stop_id, arrival_time in segments:
@@ -107,7 +179,11 @@ class RouteSearchServicer(pathfinding_pb2_grpc.RouteSearchServicer):
                 arrival_time=int(arrival_time),
             )
 
-        logger.info("GetFastestPath response segments=%s", len(segments))
+        logger.info(
+            "GetFastestPath response starts=%s segments=%s",
+            len(start_stop_ids),
+            len(segments),
+        )
         return response
 
 
