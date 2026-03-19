@@ -375,8 +375,6 @@ def _build_option_response(
     start_penalties: dict[int, int] | None = None,
 ) -> dict[str, Any]:
     algorithms = [algorithm]
-    if algorithm == "raptor":
-        algorithms.append("dijkstra")
 
     segments = []
     best_start = None

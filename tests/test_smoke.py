@@ -142,7 +142,7 @@ def test_http_departure_parses_numeric_string_timestamp():
     assert _departure_to_seconds("1738580100") == 1738580100
 
 
-def test_http_raptor_falls_back_to_dijkstra_when_no_schedule_path():
+def test_http_raptor_returns_no_path_when_schedule_unavailable():
     network = build_mock_network()
     response = build_multi_departure_response(
         network,
@@ -153,8 +153,7 @@ def test_http_raptor_falls_back_to_dijkstra_when_no_schedule_path():
         offset_minutes=(0,),
     )
 
-    assert response["segments"]
-    assert response["segments"][-1]["arrival_time"] == 2090
+    assert response["segments"] == []
 
 
 def test_origin_selects_candidate_starts_and_penalties():

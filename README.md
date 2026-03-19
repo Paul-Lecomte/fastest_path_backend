@@ -107,7 +107,7 @@ Response:
 Segments can include multiple trips when a transfer is required.
 When `start_stop_ids` is provided, all starts are evaluated and the fastest resulting path is returned.
 When `origin` is provided, nearby stops are selected automatically and scored with walking access time.
-If no RAPTOR path is found, the HTTP endpoint retries with Dijkstra and expanded nearby start stops to improve route discovery.
+If no path is found with the selected algorithm, the HTTP endpoint expands nearby start stops to improve route discovery.
 
 ## gRPC API
 
