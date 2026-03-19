@@ -6,7 +6,12 @@ import numpy as np
 
 from src.loader import build_mock_network
 from src.solver import build_path, build_path_dijkstra, run_dijkstra_fast, run_raptor, run_astar_fast
-from src.http_server import build_multi_departure_response, _departure_to_seconds, _select_starts_from_origin
+from src.http_server import (
+    build_multi_departure_response,
+    _departure_to_seconds,
+    _select_starts_from_origin,
+    _select_ends_from_destination,
+)
 from src.server import _find_fastest_segments_parallel, _get_start_stop_ids
 
 
@@ -139,7 +144,7 @@ def test_http_segments_include_stop_coordinates():
 
 
 def test_http_departure_parses_numeric_string_timestamp():
-    assert _departure_to_seconds("1738580100") == 1738580100
+    assert _departure_to_seconds("1738580100") == 39300
 
 
 def test_http_raptor_returns_no_path_when_schedule_unavailable():
@@ -191,6 +196,50 @@ def test_http_origin_route_without_explicit_start_ids():
     assert response["segments"]
     assert response["start_stop_id"] in network.stop_id_index
     assert response["candidate_start_count"] == len(start_indices)
+
+
+def test_http_destination_selects_candidate_ends_and_penalties():
+    network = build_mock_network()
+    end_indices, penalties, metadata = _select_ends_from_destination(
+        network,
+        {"lat": 48.8574, "lon": 2.3540, "radius_m": 300, "max_candidates": 2},
+    )
+
+    assert end_indices
+    assert len(end_indices) <= 2
+    assert isinstance(metadata, dict)
+    assert end_indices[0] == network.stop_id_index["C"]
+    assert penalties[end_indices[0]] <= 1
+
+
+def test_http_origin_and_destination_route_without_explicit_stop_ids():
+    network = build_mock_network()
+    start_indices, start_penalties, origin_metadata = _select_starts_from_origin(
+        network,
+        {"lat": 48.8566, "lon": 2.3522, "radius_m": 1200, "max_candidates": 3},
+    )
+    end_indices, end_penalties, destination_metadata = _select_ends_from_destination(
+        network,
+        {"lat": 48.8574, "lon": 2.3540, "radius_m": 1200, "max_candidates": 3},
+    )
+
+    response = build_multi_departure_response(
+        network,
+        "dijkstra",
+        start_indices,
+        end_indices,
+        900,
+        offset_minutes=(0,),
+        start_penalties=start_penalties,
+        end_penalties=end_penalties,
+        metadata={**origin_metadata, **destination_metadata},
+    )
+
+    assert response["segments"]
+    assert response["start_stop_id"] in network.stop_id_index
+    assert response["end_stop_id"] in network.stop_id_index
+    assert response["candidate_start_count"] == len(start_indices)
+    assert response["candidate_end_count"] == len(end_indices)
 
 
 def test_get_start_stop_ids_prefers_repeated_field():

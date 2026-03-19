@@ -74,6 +74,7 @@ Single endpoint:
 - JSON body (single start): `{"start_stop_id":"A","end_stop_id":"C","departure_time":900}`
 - JSON body (multiple starts): `{"start_stop_ids":["A","B"],"end_stop_id":"C","departure_time":900}`
 - JSON body (GPS origin): `{"origin":{"lat":48.8566,"lon":2.3522,"radius_m":1000,"max_candidates":12},"end_stop_id":"C","departure_time":900}`
+- JSON body (GPS origin + destination): `{"origin":{"lat":48.8566,"lon":2.3522,"radius_m":1000,"max_candidates":12},"destination":{"lat":48.8574,"lon":2.3540,"radius_m":1000,"max_candidates":12},"departure_time":"1773924420"}`
 
 Response:
 
@@ -107,6 +108,8 @@ Response:
 Segments can include multiple trips when a transfer is required.
 When `start_stop_ids` is provided, all starts are evaluated and the fastest resulting path is returned.
 When `origin` is provided, nearby stops are selected automatically and scored with walking access time.
+When `destination` is provided, nearby destination stops are selected automatically and scored with walking egress time.
+Large numeric `departure_time` values (Unix timestamps) are normalized to seconds-of-day.
 If no path is found with the selected algorithm, the HTTP endpoint expands nearby start stops to improve route discovery.
 
 ## gRPC API
