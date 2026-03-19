@@ -120,6 +120,24 @@ def test_http_multi_start_selects_fastest_path():
     assert response["segments"][-1]["arrival_time"] == 940
 
 
+def test_http_segments_include_stop_coordinates():
+    network = build_mock_network()
+    response = build_multi_departure_response(
+        network,
+        "dijkstra",
+        [network.stop_id_index["A"]],
+        network.stop_id_index["C"],
+        900,
+        offset_minutes=(0,),
+    )
+
+    assert response["segments"]
+    segment = response["segments"][0]
+    assert "lat" in segment and "lon" in segment
+    assert isinstance(segment["lat"], float)
+    assert isinstance(segment["lon"], float)
+
+
 def test_http_departure_parses_numeric_string_timestamp():
     assert _departure_to_seconds("1738580100") == 1738580100
 

@@ -83,7 +83,7 @@ Response:
   "transfers": 0,
   "duration_seconds": 200,
   "segments": [
-    {"trip_id": "T1", "stop_id": "C", "arrival_time": 1100}
+    {"trip_id": "T1", "stop_id": "C", "arrival_time": 1100, "lat": 48.8574, "lon": 2.354}
   ],
   "options": [
     {
@@ -91,7 +91,7 @@ Response:
       "transfers": 0,
       "duration_seconds": 200,
       "segments": [
-        {"trip_id": "T1", "stop_id": "C", "arrival_time": 1100}
+        {"trip_id": "T1", "stop_id": "C", "arrival_time": 1100, "lat": 48.8574, "lon": 2.354}
       ]
     },
     {

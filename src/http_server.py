@@ -82,6 +82,25 @@ def _haversine_distance_m(lat1: float, lon1: float, lat2: np.ndarray, lon2: np.n
     return radius_earth_m * c
 
 
+def _segment_coordinates(network: TransitNetwork, stop_id: int) -> tuple[float | None, float | None]:
+    lat = float(network.stop_lats[stop_id])
+    lon = float(network.stop_lons[stop_id])
+    if not np.isfinite(lat) or not np.isfinite(lon):
+        return None, None
+    return lat, lon
+
+
+def _segment_payload(network: TransitNetwork, trip_id: int, stop_id: int, arrival_time: int) -> dict[str, Any]:
+    lat, lon = _segment_coordinates(network, stop_id)
+    return {
+        "trip_id": network.trip_ids[trip_id],
+        "stop_id": network.stop_ids[stop_id],
+        "arrival_time": int(arrival_time),
+        "lat": lat,
+        "lon": lon,
+    }
+
+
 def _select_starts_from_origin(network: TransitNetwork, origin: Any):
     if not isinstance(origin, dict):
         return [], {}, "invalid_origin"
@@ -404,11 +423,7 @@ def _build_option_response(
         "start_stop_id": network.stop_ids[best_start] if best_start is not None else None,
         "access_walk_seconds": int(start_penalties.get(best_start, 0)) if (best_start is not None and start_penalties) else 0,
         "segments": [
-            {
-                "trip_id": network.trip_ids[trip_id],
-                "stop_id": network.stop_ids[stop_id],
-                "arrival_time": int(arrival_time),
-            }
+            _segment_payload(network, trip_id, stop_id, arrival_time)
             for trip_id, stop_id, arrival_time in segments
         ],
     }
