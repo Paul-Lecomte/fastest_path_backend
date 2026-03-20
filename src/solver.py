@@ -18,6 +18,23 @@ except Exception:  # pragma: no cover - fallback when numba is unavailable
         return wrapper
 
 
+def numba_enabled() -> bool:
+    return bool(_NUMBA_AVAILABLE)
+
+
+@njit(cache=True)
+def _lower_bound_int64(values, start: int, end: int, target: int):
+    left = start
+    right = end
+    while left < right:
+        mid = (left + right) // 2
+        if values[mid] < target:
+            left = mid + 1
+        else:
+            right = mid
+    return left
+
+
 @njit(cache=True)
 def run_raptor(
     stop_times,
@@ -26,6 +43,9 @@ def run_raptor(
     route_stops,
     route_trip_offsets,
     route_trips,
+    route_board_offsets,
+    route_board_times,
+    route_board_monotonic,
     stop_route_offsets,
     stop_routes,
     start_stop_id: int,
@@ -44,28 +64,49 @@ def run_raptor(
 
     marked = np.zeros(n_stops, dtype=np.uint8)
     new_marked = np.zeros(n_stops, dtype=np.uint8)
+    marked_list = np.empty(n_stops, dtype=np.int64)
+    new_marked_list = np.empty(n_stops, dtype=np.int64)
     route_marked = np.zeros(n_routes, dtype=np.uint8)
+    route_marked_list = np.empty(n_routes, dtype=np.int64)
+    route_min_marked_time = np.full(n_routes, inf, dtype=np.int64)
 
     earliest[start_stop_id] = departure_time
     marked[start_stop_id] = 1
+    marked_list[0] = np.int64(start_stop_id)
+    marked_count = 1
 
     best_target = inf
 
     for _round in range(max_rounds):
-        for stop_id in range(n_stops):
-            if marked[stop_id] == 0:
-                continue
+        if marked_count == 0:
+            break
+
+        route_marked_count = 0
+        for i in range(marked_count):
+            stop_id = marked_list[i]
             start = stop_route_offsets[stop_id]
             end = stop_route_offsets[stop_id + 1]
             for idx in range(start, end):
                 route_id = stop_routes[idx]
-                route_marked[route_id] = 1
+                if route_marked[route_id] == 0:
+                    route_marked[route_id] = 1
+                    route_marked_list[route_marked_count] = route_id
+                    route_marked_count += 1
+                    route_min_marked_time[route_id] = earliest[stop_id]
+                elif earliest[stop_id] < route_min_marked_time[route_id]:
+                    route_min_marked_time[route_id] = earliest[stop_id]
 
         improved = False
-        for route_id in range(n_routes):
-            if route_marked[route_id] == 0:
-                continue
+        new_marked_count = 0
+        for i in range(route_marked_count):
+            route_id = route_marked_list[i]
             route_marked[route_id] = 0
+
+            if best_target != inf and route_min_marked_time[route_id] >= best_target:
+                route_min_marked_time[route_id] = inf
+                continue
+
+            route_min_marked_time[route_id] = inf
 
             r_start = route_stop_offsets[route_id]
             r_end = route_stop_offsets[route_id + 1]
@@ -83,14 +124,24 @@ def run_raptor(
                         pass
                     else:
                         if current_trip_idx == -1:
-                            cand_idx = t_start
-                            while cand_idx < t_end:
-                                trip_id = route_trips[cand_idx]
-                                st_idx = trip_offsets[trip_id] + s_idx
-                                if stop_times[st_idx][2] >= earliest[stop_id]:
-                                    current_trip_idx = cand_idx
-                                    break
-                                cand_idx += 1
+                            board_offset = route_board_offsets[r_start + s_idx]
+                            board_end = route_board_offsets[r_start + s_idx + 1]
+                            if route_board_monotonic[r_start + s_idx] != 0:
+                                candidate = _lower_bound_int64(
+                                    route_board_times,
+                                    board_offset,
+                                    board_end,
+                                    earliest[stop_id],
+                                )
+                                if candidate < board_end:
+                                    current_trip_idx = t_start + (candidate - board_offset)
+                            else:
+                                candidate = board_offset
+                                while candidate < board_end:
+                                    if route_board_times[candidate] >= earliest[stop_id]:
+                                        current_trip_idx = t_start + (candidate - board_offset)
+                                        break
+                                    candidate += 1
 
                 if current_trip_idx == -1:
                     continue
@@ -107,7 +158,10 @@ def run_raptor(
                     pred_stop[stop_id] = route_stops[r_start + s_idx - 1] if s_idx > 0 else stop_id
                     pred_trip[stop_id] = trip_id
                     pred_time[stop_id] = arrival_time
-                    new_marked[stop_id] = 1
+                    if new_marked[stop_id] == 0:
+                        new_marked[stop_id] = 1
+                        new_marked_list[new_marked_count] = stop_id
+                        new_marked_count += 1
                     improved = True
                     if stop_id == end_stop_id:
                         best_target = arrival_time
@@ -115,9 +169,17 @@ def run_raptor(
         if not improved:
             break
 
-        for stop_id in range(n_stops):
-            marked[stop_id] = new_marked[stop_id]
+        for i in range(marked_count):
+            stop_id = marked_list[i]
+            marked[stop_id] = 0
+
+        for i in range(new_marked_count):
+            stop_id = new_marked_list[i]
+            marked[stop_id] = 1
             new_marked[stop_id] = 0
+            marked_list[i] = stop_id
+
+        marked_count = new_marked_count
 
     return earliest, pred_stop, pred_trip, pred_time
 

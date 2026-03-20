@@ -78,6 +78,9 @@ class TransitNetwork:
     route_stops: np.ndarray
     route_trip_offsets: np.ndarray
     route_trips: np.ndarray
+    route_board_offsets: np.ndarray
+    route_board_times: np.ndarray
+    route_board_monotonic: np.ndarray
     stop_route_offsets: np.ndarray
     stop_routes: np.ndarray
 
@@ -194,6 +197,9 @@ class NetworkLoader:
             route_stops,
             route_trip_offsets,
             route_trips,
+            route_board_offsets,
+            route_board_times,
+            route_board_monotonic,
             stop_route_offsets,
             stop_routes,
         ) = _build_routes(stop_times_array, trip_offsets, len(stop_ids))
@@ -217,6 +223,9 @@ class NetworkLoader:
             route_stops=route_stops,
             route_trip_offsets=route_trip_offsets,
             route_trips=route_trips,
+            route_board_offsets=route_board_offsets,
+            route_board_times=route_board_times,
+            route_board_monotonic=route_board_monotonic,
             stop_route_offsets=stop_route_offsets,
             stop_routes=stop_routes,
         )
@@ -316,6 +325,32 @@ def _build_routes(
             cursor += 1
     route_trip_offsets[len(route_trips_list)] = cursor
 
+    route_stop_trip_counts = [len(route_stops_list[route_id]) * len(route_trips_list[route_id]) for route_id in range(len(route_stops_list))]
+    total_route_board_values = sum(route_stop_trip_counts)
+    route_board_offsets = np.zeros(total_stops + 1, dtype=np.int64)
+    route_board_times = np.zeros(total_route_board_values, dtype=np.int64)
+    route_board_monotonic = np.ones(total_stops, dtype=np.uint8)
+
+    cursor = 0
+    for route_id, stops in enumerate(route_stops_list):
+        trips = route_trips_list[route_id]
+        route_stop_start = int(route_stop_offsets[route_id])
+        for stop_local_index, _ in enumerate(stops):
+            global_route_stop_index = route_stop_start + stop_local_index
+            route_board_offsets[global_route_stop_index] = cursor
+            prev_time = -1
+            is_monotonic = 1
+            for trip_id in trips:
+                st_idx = int(trip_offsets[trip_id]) + stop_local_index
+                arrival_time = int(stop_times[st_idx][2])
+                if prev_time > arrival_time:
+                    is_monotonic = 0
+                route_board_times[cursor] = arrival_time
+                prev_time = arrival_time
+                cursor += 1
+            route_board_monotonic[global_route_stop_index] = is_monotonic
+    route_board_offsets[total_stops] = cursor
+
     stop_routes_list: List[List[int]] = [[] for _ in range(n_stops)]
     for route_id, stops in enumerate(route_stops_list):
         for stop_id in stops:
@@ -337,6 +372,9 @@ def _build_routes(
         route_stops,
         route_trip_offsets,
         route_trips,
+        route_board_offsets,
+        route_board_times,
+        route_board_monotonic,
         stop_route_offsets,
         stop_routes,
     )
@@ -379,6 +417,9 @@ def build_mock_network() -> TransitNetwork:
         route_stops,
         route_trip_offsets,
         route_trips,
+        route_board_offsets,
+        route_board_times,
+        route_board_monotonic,
         stop_route_offsets,
         stop_routes,
     ) = _build_routes(stop_times_array, trip_offsets, len(stop_ids))
@@ -402,6 +443,9 @@ def build_mock_network() -> TransitNetwork:
         route_stops=route_stops,
         route_trip_offsets=route_trip_offsets,
         route_trips=route_trips,
+        route_board_offsets=route_board_offsets,
+        route_board_times=route_board_times,
+        route_board_monotonic=route_board_monotonic,
         stop_route_offsets=stop_route_offsets,
         stop_routes=stop_routes,
     )

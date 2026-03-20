@@ -176,14 +176,26 @@ Neo4j stop times are parsed from `HH:MM:SS` or numeric values into seconds.
 ## Notes on Numba / Python 3.13
 
 Numba does not yet support Python 3.13. The code runs without Numba (pure Python mode),
-but for JIT acceleration, use Python 3.12 and install `numba`.
+but for JIT acceleration, use Python 3.12 and install dependencies from `requirements.txt`
+(includes `numba` for Python < 3.13).
 
 ---
 
 ## Benchmark
 
 ```powershell
-python -m scripts.bench_pathfinding --start A --end C --departure 28800 --repeat 3
+python -m scripts.bench_pathfinding --start A --end C --departure 28800 --repeat 3 --warmup
+```
+
+The benchmark now reports:
+- `network_load` time
+- per-algorithm `warmup` time (optional)
+- `first` run cost and `steady` average for measured runs
+
+Optional RAPTOR performance gate:
+
+```powershell
+python -m scripts.check_bench --repeat 5 --warmup --max-first 5.0 --max-steady 2.0
 ```
 
 ---

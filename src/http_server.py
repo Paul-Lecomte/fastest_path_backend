@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from datetime import datetime, timezone
@@ -12,7 +13,7 @@ import numpy as np
 
 from .config import setup_logging
 from .loader import NetworkLoader, build_mock_network, TransitNetwork
-from .solver import build_path, build_path_dijkstra, run_dijkstra_fast, run_raptor, run_astar_fast
+from .solver import build_path, build_path_dijkstra, run_dijkstra_fast, run_raptor, run_astar_fast, numba_enabled
 
 
 logger = logging.getLogger("pathfinding.http")
@@ -259,6 +260,35 @@ def load_network() -> TransitNetwork:
         loader.close()
 
 
+def _warmup_raptor(network: TransitNetwork) -> None:
+    n_stops = int(network.stop_route_offsets.shape[0] - 1)
+    if n_stops <= 0:
+        return
+
+    start_idx = 0
+    end_idx = 0 if n_stops == 1 else 1
+    started = time.perf_counter()
+    run_raptor(
+        network.stop_times,
+        network.trip_offsets,
+        network.route_stop_offsets,
+        network.route_stops,
+        network.route_trip_offsets,
+        network.route_trips,
+        network.route_board_offsets,
+        network.route_board_times,
+        network.route_board_monotonic,
+        network.stop_route_offsets,
+        network.stop_routes,
+        start_idx,
+        end_idx,
+        0,
+        max_rounds=1,
+    )
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    logger.info("RAPTOR warmup complete in %.2f ms", elapsed_ms)
+
+
 def _compute_segments(
     network: TransitNetwork,
     algorithm: str,
@@ -274,6 +304,9 @@ def _compute_segments(
             network.route_stops,
             network.route_trip_offsets,
             network.route_trips,
+            network.route_board_offsets,
+            network.route_board_times,
+            network.route_board_monotonic,
             network.stop_route_offsets,
             network.stop_routes,
             start_idx,
@@ -751,6 +784,11 @@ def serve(host: str = "0.0.0.0", port: int = 8080) -> ThreadingHTTPServer:
     setup_logging()
     server = ThreadingHTTPServer((host, port), PathRequestHandler)
     PathRequestHandler.network = load_network()
+    logger.info("RAPTOR numba_jit_enabled=%s", numba_enabled())
+    try:
+        _warmup_raptor(PathRequestHandler.network)
+    except Exception as exc:
+        logger.warning("RAPTOR warmup skipped due to error: %s", exc)
     logger.info("HTTP server listening on %s:%s", host, port)
     return server
 
