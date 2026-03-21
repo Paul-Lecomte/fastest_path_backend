@@ -4,6 +4,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 import logging
+import pickle
+import time
+from pathlib import Path
 import numpy as np
 from neo4j import GraphDatabase
 
@@ -83,6 +86,52 @@ class TransitNetwork:
     route_board_monotonic: np.ndarray
     stop_route_offsets: np.ndarray
     stop_routes: np.ndarray
+
+
+def load_network_from_cache(cache_path: str, max_age_seconds: int | None = None) -> TransitNetwork | None:
+    path = Path(cache_path)
+    if not path.exists():
+        return None
+
+    if max_age_seconds is not None:
+        age_seconds = int(time.time() - path.stat().st_mtime)
+        if age_seconds > max_age_seconds:
+            logger.info(
+                "Skipping network cache at %s because age=%ss exceeds max_age=%ss",
+                path,
+                age_seconds,
+                max_age_seconds,
+            )
+            return None
+
+    try:
+        with path.open("rb") as handle:
+            network = pickle.load(handle)
+        if not isinstance(network, TransitNetwork):
+            logger.warning("Ignoring invalid network cache payload at %s", path)
+            return None
+        logger.info(
+            "Loaded network cache path=%s stops=%s stop_times=%s routes=%s",
+            path,
+            network.stops.shape[0],
+            network.stop_times.shape[0],
+            network.routes.shape[0],
+        )
+        return network
+    except Exception as exc:
+        logger.warning("Failed to load network cache path=%s error=%s", path, exc)
+        return None
+
+
+def save_network_to_cache(cache_path: str, network: TransitNetwork) -> None:
+    path = Path(cache_path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("wb") as handle:
+            pickle.dump(network, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        logger.info("Saved network cache to %s", path)
+    except Exception as exc:
+        logger.warning("Failed to save network cache path=%s error=%s", path, exc)
 
 
 class NetworkLoader:
