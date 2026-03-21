@@ -12,42 +12,56 @@ import numpy as np
 from . import pathfinding_pb2, pathfinding_pb2_grpc
 from .config import get_neo4j_config, setup_logging
 from .loader import NetworkLoader, build_mock_network
-from .solver import build_path, build_path_dijkstra, run_dijkstra_fast, run_raptor, run_astar_fast
+from .solver import build_path, build_path_dijkstra, run_dijkstra_fast, run_raptor_with_stats, run_astar_fast
 
 
 logger = logging.getLogger("pathfinding.server")
 
 SUPPORTED_ALGORITHMS = {"raptor", "dijkstra", "astar"}
+RAPTOR_ROUND_BUDGETS = (8, 16, 32, 64)
+
+
+def _algorithm_sequence(primary: str) -> tuple[str, ...]:
+    if primary == "raptor":
+        return ("raptor", "astar", "dijkstra")
+    if primary == "astar":
+        return ("astar", "dijkstra")
+    return ("dijkstra",)
 
 
 def _compute_segments(network, algorithm: str, start_stop_id: int, end_stop_id: int, departure_time: int):
     if algorithm == "raptor":
-        earliest, pred_stop, pred_trip, pred_time = run_raptor(
-            network.stop_times,
-            network.trip_offsets,
-            network.route_stop_offsets,
-            network.route_stops,
-            network.route_trip_offsets,
-            network.route_trips,
-            network.route_board_offsets,
-            network.route_board_times,
-            network.route_board_monotonic,
-            network.stop_route_offsets,
-            network.stop_routes,
-            start_stop_id,
-            end_stop_id,
-            departure_time,
-        )
+        for max_rounds in RAPTOR_ROUND_BUDGETS:
+            earliest, pred_stop, pred_trip, pred_time, _, _, _ = run_raptor_with_stats(
+                network.stop_times,
+                network.trip_offsets,
+                network.route_stop_offsets,
+                network.route_stops,
+                network.route_trip_offsets,
+                network.route_trips,
+                network.route_board_offsets,
+                network.route_board_times,
+                network.route_board_monotonic,
+                network.stop_route_offsets,
+                network.stop_routes,
+                start_stop_id,
+                end_stop_id,
+                departure_time,
+                max_rounds=max_rounds,
+            )
 
-        return build_path(
-            network.stop_times,
-            network.trip_offsets,
-            end_stop_id,
-            earliest,
-            pred_stop,
-            pred_trip,
-            pred_time,
-        )
+            segments = build_path(
+                network.stop_times,
+                network.trip_offsets,
+                end_stop_id,
+                earliest,
+                pred_stop,
+                pred_trip,
+                pred_time,
+            )
+            if segments:
+                return segments
+        return []
     if algorithm == "dijkstra":
         dist, pred_stop, pred_trip = run_dijkstra_fast(
             network.adj_offsets,
@@ -101,23 +115,38 @@ def _get_start_stop_ids(request) -> list[str]:
 
 
 async def _find_fastest_segments_parallel(network, algorithm: str, start_stop_ids: list[int], end_stop_id: int, departure_time: int):
+    sequence = _algorithm_sequence(algorithm)
     if len(start_stop_ids) == 1:
-        return _compute_segments(network, algorithm, start_stop_ids[0], end_stop_id, departure_time)
+        for selected_algorithm in sequence:
+            segments = _compute_segments(network, selected_algorithm, start_stop_ids[0], end_stop_id, departure_time)
+            if segments:
+                return segments
+        return []
 
     loop = asyncio.get_running_loop()
-    tasks = [
-        loop.run_in_executor(
-            None,
-            _compute_segments,
-            network,
-            algorithm,
-            start_stop_id,
-            end_stop_id,
-            departure_time,
-        )
-        for start_stop_id in start_stop_ids
-    ]
-    results = await asyncio.gather(*tasks)
+    results = []
+    for selected_algorithm in sequence:
+        tasks = [
+            loop.run_in_executor(
+                None,
+                _compute_segments,
+                network,
+                selected_algorithm,
+                start_stop_id,
+                end_stop_id,
+                departure_time,
+            )
+            for start_stop_id in start_stop_ids
+        ]
+        results = await asyncio.gather(*tasks)
+
+        has_path = False
+        for segments in results:
+            if segments:
+                has_path = True
+                break
+        if has_path:
+            break
 
     best_segments = []
     best_arrival = None
@@ -191,11 +220,25 @@ class RouteSearchServicer(pathfinding_pb2_grpc.RouteSearchServicer):
 
 
 def load_network():
+    from .config import get_network_cache_config
+    from .loader import load_network_from_cache, save_network_to_cache
+
     config = get_neo4j_config()
+    cache_config = get_network_cache_config()
+    cache_path = cache_config["path"]
+
+    if cache_config["enabled"] and not cache_config["force_refresh"]:
+        cached_network = load_network_from_cache(cache_path, cache_config["max_age_seconds"])
+        if cached_network is not None:
+            logger.info("Using cached network from %s", cache_path)
+            return cached_network
+
     loader = NetworkLoader(config["uri"], config["user"], config["password"])
     try:
         logger.info("Loading network from Neo4j at %s", config["uri"])
         network = loader.fetch_to_numpy()
+        if cache_config["enabled"]:
+            save_network_to_cache(cache_path, network)
         logger.info(
             "Loaded network stops=%s stop_times=%s routes=%s",
             network.stops.shape[0],
@@ -204,6 +247,11 @@ def load_network():
         )
         return network
     except Exception as exc:
+        if cache_config["enabled"]:
+            cached_network = load_network_from_cache(cache_path)
+            if cached_network is not None:
+                logger.warning("Neo4j load failed, using cached network path=%s error=%s", cache_path, exc)
+                return cached_network
         logger.warning("Neo4j load failed, using mock network: %s", exc)
         return build_mock_network()
     finally:
