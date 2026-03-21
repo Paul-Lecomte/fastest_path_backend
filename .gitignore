@@ -4,3 +4,6 @@
 *.pyc
 
 .tests
+
+.env
+.cache/
