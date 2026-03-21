@@ -36,7 +36,7 @@ def _lower_bound_int64(values, start: int, end: int, target: int):
 
 
 @njit(cache=True)
-def run_raptor(
+def run_raptor_with_stats(
     stop_times,
     trip_offsets,
     route_stop_offsets,
@@ -76,8 +76,10 @@ def run_raptor(
     marked_count = 1
 
     best_target = inf
+    rounds_used = np.int64(0)
 
     for _round in range(max_rounds):
+        rounds_used += 1
         if marked_count == 0:
             break
 
@@ -123,25 +125,37 @@ def run_raptor(
                     if best_target != inf and earliest[stop_id] >= best_target:
                         pass
                     else:
-                        if current_trip_idx == -1:
-                            board_offset = route_board_offsets[r_start + s_idx]
-                            board_end = route_board_offsets[r_start + s_idx + 1]
-                            if route_board_monotonic[r_start + s_idx] != 0:
-                                candidate = _lower_bound_int64(
-                                    route_board_times,
-                                    board_offset,
-                                    board_end,
-                                    earliest[stop_id],
-                                )
-                                if candidate < board_end:
-                                    current_trip_idx = t_start + (candidate - board_offset)
+                        board_offset = route_board_offsets[r_start + s_idx]
+                        board_end = route_board_offsets[r_start + s_idx + 1]
+                        candidate_trip_idx = -1
+                        candidate_arrival = inf
+                        if route_board_monotonic[r_start + s_idx] != 0:
+                            candidate = _lower_bound_int64(
+                                route_board_times,
+                                board_offset,
+                                board_end,
+                                earliest[stop_id],
+                            )
+                            if candidate < board_end:
+                                candidate_trip_idx = t_start + (candidate - board_offset)
+                                candidate_arrival = route_board_times[candidate]
+                        else:
+                            candidate = board_offset
+                            while candidate < board_end:
+                                value = route_board_times[candidate]
+                                if value >= earliest[stop_id] and value < candidate_arrival:
+                                    candidate_arrival = value
+                                    candidate_trip_idx = t_start + (candidate - board_offset)
+                                candidate += 1
+
+                        if candidate_trip_idx != -1:
+                            if current_trip_idx == -1:
+                                current_trip_idx = candidate_trip_idx
                             else:
-                                candidate = board_offset
-                                while candidate < board_end:
-                                    if route_board_times[candidate] >= earliest[stop_id]:
-                                        current_trip_idx = t_start + (candidate - board_offset)
-                                        break
-                                    candidate += 1
+                                current_trip_id = route_trips[current_trip_idx]
+                                current_arrival = stop_times[trip_offsets[current_trip_id] + s_idx][2]
+                                if candidate_arrival < current_arrival:
+                                    current_trip_idx = candidate_trip_idx
 
                 if current_trip_idx == -1:
                     continue
@@ -181,6 +195,46 @@ def run_raptor(
 
         marked_count = new_marked_count
 
+    reached_target = np.uint8(0)
+    if end_stop_id >= 0 and end_stop_id < n_stops:
+        reached_target = np.uint8(1 if earliest[end_stop_id] < inf else 0)
+    return earliest, pred_stop, pred_trip, pred_time, rounds_used, marked_count, reached_target
+
+
+def run_raptor(
+    stop_times,
+    trip_offsets,
+    route_stop_offsets,
+    route_stops,
+    route_trip_offsets,
+    route_trips,
+    route_board_offsets,
+    route_board_times,
+    route_board_monotonic,
+    stop_route_offsets,
+    stop_routes,
+    start_stop_id: int,
+    end_stop_id: int,
+    departure_time: int,
+    max_rounds: int = 6,
+):
+    earliest, pred_stop, pred_trip, pred_time, _, _, _ = run_raptor_with_stats(
+        stop_times,
+        trip_offsets,
+        route_stop_offsets,
+        route_stops,
+        route_trip_offsets,
+        route_trips,
+        route_board_offsets,
+        route_board_times,
+        route_board_monotonic,
+        stop_route_offsets,
+        stop_routes,
+        start_stop_id,
+        end_stop_id,
+        departure_time,
+        max_rounds,
+    )
     return earliest, pred_stop, pred_trip, pred_time
 
 
