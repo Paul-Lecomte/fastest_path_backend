@@ -4,7 +4,15 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from src.loader import build_mock_network
+from src.loader import (
+    TransitNetwork,
+    STOPS_DTYPE,
+    ROUTES_DTYPE,
+    STOP_TIMES_DTYPE,
+    _build_adjacency,
+    _build_routes,
+    build_mock_network,
+)
 from src.solver import build_path, build_path_dijkstra, run_dijkstra_fast, run_raptor, run_astar_fast
 from src.http_server import (
     build_multi_departure_response,
@@ -13,6 +21,82 @@ from src.http_server import (
     _select_ends_from_destination,
 )
 from src.server import _find_fastest_segments_parallel, _get_start_stop_ids
+
+
+def _build_linear_transfer_network(stop_count: int = 12) -> TransitNetwork:
+    stop_ids = [f"S{i}" for i in range(stop_count)]
+    trip_ids = [f"T{i}" for i in range(stop_count - 1)]
+
+    stops_array = np.zeros(len(stop_ids), dtype=STOPS_DTYPE)
+    for i in range(len(stop_ids)):
+        stops_array[i] = (i, i)
+
+    rows = []
+    for trip_id in range(stop_count - 1):
+        departure = 1000 + trip_id * 120
+        arrival = departure + 60
+        rows.append((trip_id, trip_id, departure, 1))
+        rows.append((trip_id + 1, trip_id, arrival, 2))
+
+    stop_times_array = np.array(rows, dtype=STOP_TIMES_DTYPE)
+
+    routes_array = np.zeros(len(trip_ids), dtype=ROUTES_DTYPE)
+    for i in range(len(trip_ids)):
+        routes_array[i] = (i, i)
+
+    trip_offsets = np.zeros(len(trip_ids) + 1, dtype=np.int64)
+    for trip_id in range(len(trip_ids)):
+        trip_offsets[trip_id] = trip_id * 2
+    trip_offsets[len(trip_ids)] = len(rows)
+
+    adj_offsets, adj_neighbors, adj_weights, adj_trip_ids = _build_adjacency(
+        stop_times_array,
+        trip_offsets,
+        len(stop_ids),
+    )
+
+    (
+        route_stop_offsets,
+        route_stops,
+        route_trip_offsets,
+        route_trips,
+        route_board_offsets,
+        route_board_times,
+        route_board_monotonic,
+        stop_route_offsets,
+        stop_routes,
+    ) = _build_routes(stop_times_array, trip_offsets, len(stop_ids))
+
+    stop_id_index = {value: idx for idx, value in enumerate(stop_ids)}
+    trip_id_index = {value: idx for idx, value in enumerate(trip_ids)}
+    stop_lats = np.full(len(stop_ids), np.nan, dtype=np.float64)
+    stop_lons = np.full(len(stop_ids), np.nan, dtype=np.float64)
+
+    return TransitNetwork(
+        stops=stops_array,
+        stop_times=stop_times_array,
+        routes=routes_array,
+        stop_id_index=stop_id_index,
+        trip_id_index=trip_id_index,
+        stop_ids=stop_ids,
+        stop_lats=stop_lats,
+        stop_lons=stop_lons,
+        trip_ids=trip_ids,
+        trip_offsets=trip_offsets,
+        adj_offsets=adj_offsets,
+        adj_neighbors=adj_neighbors,
+        adj_weights=adj_weights,
+        adj_trip_ids=adj_trip_ids,
+        route_stop_offsets=route_stop_offsets,
+        route_stops=route_stops,
+        route_trip_offsets=route_trip_offsets,
+        route_trips=route_trips,
+        route_board_offsets=route_board_offsets,
+        route_board_times=route_board_times,
+        route_board_monotonic=route_board_monotonic,
+        stop_route_offsets=stop_route_offsets,
+        stop_routes=stop_routes,
+    )
 
 
 def test_smoke_mock_network():
@@ -268,3 +352,34 @@ def test_parallel_multi_start_selects_fastest_path():
 
     assert segments
     assert segments[-1][2] == 940
+
+
+def test_raptor_handles_long_transfer_chain():
+    network = _build_linear_transfer_network(14)
+    response = build_multi_departure_response(
+        network,
+        "raptor",
+        [network.stop_id_index["S0"]],
+        network.stop_id_index["S13"],
+        900,
+        offset_minutes=(0,),
+    )
+
+    assert response["segments"]
+    assert response["segments"][-1]["stop_id"] == "S13"
+
+
+def test_raptor_option_exposes_resolver_metadata():
+    network = _build_linear_transfer_network(14)
+    response = build_multi_departure_response(
+        network,
+        "raptor",
+        [network.stop_id_index["S0"]],
+        network.stop_id_index["S13"],
+        900,
+        offset_minutes=(0,),
+    )
+
+    option = response["options"][0]
+    assert "resolver_algorithm" in option
+    assert "fallback_used" in option
