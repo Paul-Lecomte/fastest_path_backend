@@ -13,7 +13,15 @@ import numpy as np
 
 from .config import setup_logging
 from .loader import NetworkLoader, build_mock_network, TransitNetwork
-from .solver import build_path, build_path_dijkstra, run_dijkstra_fast, run_raptor, run_astar_fast, numba_enabled
+from .solver import (
+    build_path,
+    build_path_dijkstra,
+    run_dijkstra_fast,
+    run_raptor,
+    run_raptor_with_stats,
+    run_astar_fast,
+    numba_enabled,
+)
 
 
 logger = logging.getLogger("pathfinding.http")
@@ -25,6 +33,8 @@ DEFAULT_ORIGIN_RADIUS_M = 1000.0
 DEFAULT_ORIGIN_MAX_CANDIDATES = 12
 DEFAULT_WALK_SPEED_MPS = 1.4
 UNIX_TIMESTAMP_MIN_SECONDS = 946684800
+DEFAULT_RAPTOR_ROUNDS_MIN = 8
+DEFAULT_RAPTOR_ROUNDS_MAX = 64
 
 
 def _count_transfers(segments) -> int:
@@ -239,13 +249,25 @@ def _select_ends_from_destination(network: TransitNetwork, destination: Any):
 
 
 def load_network() -> TransitNetwork:
-    from .config import get_neo4j_config
+    from .config import get_neo4j_config, get_network_cache_config
+    from .loader import load_network_from_cache, save_network_to_cache
 
     config = get_neo4j_config()
+    cache_config = get_network_cache_config()
+    cache_path = cache_config["path"]
+
+    if cache_config["enabled"] and not cache_config["force_refresh"]:
+        cached_network = load_network_from_cache(cache_path, cache_config["max_age_seconds"])
+        if cached_network is not None:
+            logger.info("Using cached network from %s", cache_path)
+            return cached_network
+
     loader = NetworkLoader(config["uri"], config["user"], config["password"])
     try:
         logger.info("Loading network from Neo4j at %s", config["uri"])
         network = loader.fetch_to_numpy()
+        if cache_config["enabled"]:
+            save_network_to_cache(cache_path, network)
         logger.info(
             "Loaded network stops=%s stop_times=%s routes=%s",
             network.stops.shape[0],
@@ -254,6 +276,11 @@ def load_network() -> TransitNetwork:
         )
         return network
     except Exception as exc:
+        if cache_config["enabled"]:
+            cached_network = load_network_from_cache(cache_path)
+            if cached_network is not None:
+                logger.warning("Neo4j load failed, using cached network path=%s error=%s", cache_path, exc)
+                return cached_network
         logger.warning("Neo4j load failed, using mock network: %s", exc)
         return build_mock_network()
     finally:
@@ -289,6 +316,26 @@ def _warmup_raptor(network: TransitNetwork) -> None:
     logger.info("RAPTOR warmup complete in %.2f ms", elapsed_ms)
 
 
+def _raptor_round_budgets(network: TransitNetwork) -> tuple[int, ...]:
+    n_stops = int(network.stop_route_offsets.shape[0] - 1)
+    adaptive_cap = min(DEFAULT_RAPTOR_ROUNDS_MAX, max(DEFAULT_RAPTOR_ROUNDS_MIN, int(np.sqrt(max(1, n_stops))) + 8))
+    budgets = []
+    current = DEFAULT_RAPTOR_ROUNDS_MIN
+    while current < adaptive_cap:
+        budgets.append(current)
+        current *= 2
+    budgets.append(adaptive_cap)
+    return tuple(dict.fromkeys(budgets))
+
+
+def _algorithm_sequence(primary: str) -> tuple[str, ...]:
+    if primary == "raptor":
+        return ("raptor", "astar", "dijkstra")
+    if primary == "astar":
+        return ("astar", "dijkstra")
+    return ("dijkstra",)
+
+
 def _compute_segments(
     network: TransitNetwork,
     algorithm: str,
@@ -297,31 +344,56 @@ def _compute_segments(
     departure_time: int,
 ):
     if algorithm == "raptor":
-        earliest, pred_stop, pred_trip, pred_time = run_raptor(
-            network.stop_times,
-            network.trip_offsets,
-            network.route_stop_offsets,
-            network.route_stops,
-            network.route_trip_offsets,
-            network.route_trips,
-            network.route_board_offsets,
-            network.route_board_times,
-            network.route_board_monotonic,
-            network.stop_route_offsets,
-            network.stop_routes,
+        attempt_summaries = []
+        for max_rounds in _raptor_round_budgets(network):
+            started = time.perf_counter()
+            earliest, pred_stop, pred_trip, pred_time, rounds_used, marked_count, reached_target = run_raptor_with_stats(
+                network.stop_times,
+                network.trip_offsets,
+                network.route_stop_offsets,
+                network.route_stops,
+                network.route_trip_offsets,
+                network.route_trips,
+                network.route_board_offsets,
+                network.route_board_times,
+                network.route_board_monotonic,
+                network.stop_route_offsets,
+                network.stop_routes,
+                start_idx,
+                end_idx,
+                departure_time,
+                max_rounds=max_rounds,
+            )
+            segments = build_path(
+                network.stop_times,
+                network.trip_offsets,
+                end_idx,
+                earliest,
+                pred_stop,
+                pred_trip,
+                pred_time,
+            )
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            attempt_summaries.append(
+                f"cap={max_rounds} used={int(rounds_used)} reached={int(reached_target)} marked={int(marked_count)} ms={elapsed_ms:.1f} segs={len(segments)}"
+            )
+            if segments:
+                if max_rounds > DEFAULT_RAPTOR_ROUNDS_MIN:
+                    logger.info(
+                        "RAPTOR long-trip success start=%s end=%s attempts=%s",
+                        start_idx,
+                        end_idx,
+                        " | ".join(attempt_summaries),
+                    )
+                return segments
+
+        logger.info(
+            "RAPTOR no-path start=%s end=%s attempts=%s",
             start_idx,
             end_idx,
-            departure_time,
+            " | ".join(attempt_summaries),
         )
-        return build_path(
-            network.stop_times,
-            network.trip_offsets,
-            end_idx,
-            earliest,
-            pred_stop,
-            pred_trip,
-            pred_time,
-        )
+        return []
     if algorithm == "dijkstra":
         dist, pred_stop, pred_trip = run_dijkstra_fast(
             network.adj_offsets,
@@ -472,6 +544,115 @@ def _find_best_segments_for_starts(
     return best_segments, best_start, best_score
 
 
+def _best_end_from_earliest(
+    earliest,
+    end_indices: list[int],
+    end_penalties: dict[int, int] | None = None,
+):
+    inf = np.int64(2**62)
+    best_end = None
+    best_score = None
+    for end_idx in end_indices:
+        arrival = int(earliest[int(end_idx)])
+        if arrival >= inf:
+            continue
+        egress_penalty = 0 if end_penalties is None else int(end_penalties.get(int(end_idx), 0))
+        score = arrival + egress_penalty
+        if best_score is None or score < best_score:
+            best_score = score
+            best_end = int(end_idx)
+    return best_end, best_score
+
+
+def _find_best_segments_for_od_candidates_raptor(
+    network: TransitNetwork,
+    start_indices: list[int],
+    end_indices: list[int],
+    departure_time: int,
+    start_penalties: dict[int, int] | None = None,
+    end_penalties: dict[int, int] | None = None,
+):
+    def compute_for_start(start_idx: int):
+        attempt_summaries = []
+        for max_rounds in _raptor_round_budgets(network):
+            started = time.perf_counter()
+            earliest, pred_stop, pred_trip, pred_time, rounds_used, marked_count, _ = run_raptor_with_stats(
+                network.stop_times,
+                network.trip_offsets,
+                network.route_stop_offsets,
+                network.route_stops,
+                network.route_trip_offsets,
+                network.route_trips,
+                network.route_board_offsets,
+                network.route_board_times,
+                network.route_board_monotonic,
+                network.stop_route_offsets,
+                network.stop_routes,
+                int(start_idx),
+                -1,
+                departure_time,
+                max_rounds=max_rounds,
+            )
+            best_end, best_end_score = _best_end_from_earliest(earliest, end_indices, end_penalties)
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            attempt_summaries.append(
+                f"cap={max_rounds} used={int(rounds_used)} marked={int(marked_count)} ms={elapsed_ms:.1f} best_end={best_end}"
+            )
+
+            if best_end is None:
+                continue
+
+            segments = build_path(
+                network.stop_times,
+                network.trip_offsets,
+                best_end,
+                earliest,
+                pred_stop,
+                pred_trip,
+                pred_time,
+            )
+            if not segments:
+                continue
+
+            start_penalty = 0 if start_penalties is None else int(start_penalties.get(int(start_idx), 0))
+            total_score = int(best_end_score) + start_penalty
+            logger.info(
+                "RAPTOR multi-end success start=%s end=%s attempts=%s",
+                start_idx,
+                best_end,
+                " | ".join(attempt_summaries),
+            )
+            return segments, int(start_idx), best_end, total_score
+
+        logger.info("RAPTOR multi-end no-path start=%s attempts=%s", start_idx, " | ".join(attempt_summaries))
+        return [], None, None, None
+
+    if len(start_indices) == 1:
+        return compute_for_start(start_indices[0])
+
+    if not numba_enabled():
+        results = [compute_for_start(start_idx) for start_idx in start_indices]
+    else:
+        with ThreadPoolExecutor(max_workers=min(len(start_indices), 16)) as pool:
+            futures = [pool.submit(compute_for_start, start_idx) for start_idx in start_indices]
+            results = [future.result() for future in futures]
+
+    best_segments = []
+    best_start = None
+    best_end = None
+    best_score = None
+    for segments, start_idx, end_idx, score in results:
+        if not segments or start_idx is None or end_idx is None or score is None:
+            continue
+        if best_score is None or score < best_score:
+            best_score = int(score)
+            best_segments = segments
+            best_start = int(start_idx)
+            best_end = int(end_idx)
+
+    return best_segments, best_start, best_end, best_score
+
+
 def _find_best_segments_for_od_candidates(
     network: TransitNetwork,
     algorithm: str,
@@ -481,6 +662,16 @@ def _find_best_segments_for_od_candidates(
     start_penalties: dict[int, int] | None = None,
     end_penalties: dict[int, int] | None = None,
 ):
+    if algorithm == "raptor":
+        return _find_best_segments_for_od_candidates_raptor(
+            network,
+            start_indices,
+            end_indices,
+            departure_time,
+            start_penalties,
+            end_penalties,
+        )
+
     best_segments = []
     best_start = None
     best_end = None
@@ -518,11 +709,12 @@ def _build_option_response(
     start_penalties: dict[int, int] | None = None,
     end_penalties: dict[int, int] | None = None,
 ) -> dict[str, Any]:
-    algorithms = [algorithm]
+    algorithms = _algorithm_sequence(algorithm)
 
     segments = []
     best_start = None
     best_end = None
+    resolved_algorithm = algorithm
     for selected_algorithm in algorithms:
         segments, best_start, best_end, _ = _find_best_segments_for_od_candidates(
             network,
@@ -534,6 +726,7 @@ def _build_option_response(
             end_penalties,
         )
         if segments:
+            resolved_algorithm = selected_algorithm
             break
 
     if not segments:
@@ -550,8 +743,10 @@ def _build_option_response(
                     end_penalties,
                 )
                 if segments:
+                    resolved_algorithm = selected_algorithm
                     logger.info(
-                        "Route fallback used algorithm=%s start_expansion=%s original_starts=%s",
+                        "Route fallback used algorithm=%s resolved=%s start_expansion=%s original_starts=%s",
+                        algorithm,
                         selected_algorithm,
                         len(expanded_start_indices),
                         len(start_indices),
@@ -563,6 +758,8 @@ def _build_option_response(
         return {}
     return {
         "departure_time": int(departure_time),
+        "resolver_algorithm": resolved_algorithm,
+        "fallback_used": resolved_algorithm != algorithm,
         "transfers": _count_transfers(segments),
         "duration_seconds": int(segments[-1][2] - departure_time) if segments else None,
         "start_stop_id": network.stop_ids[best_start] if best_start is not None else None,
@@ -593,10 +790,28 @@ def build_multi_departure_response(
         end_indices = [int(end_idx)]
 
     options = [None] * len(offset_minutes)
-    with ThreadPoolExecutor(max_workers=min(len(offset_minutes), 8)) as pool:
-        futures = {
-            pool.submit(
-                _build_option_response,
+    use_parallel_offsets = not (algorithm == "raptor" and not numba_enabled())
+    if use_parallel_offsets:
+        with ThreadPoolExecutor(max_workers=min(len(offset_minutes), 8)) as pool:
+            futures = {
+                pool.submit(
+                    _build_option_response,
+                    network,
+                    algorithm,
+                    start_indices,
+                    end_indices,
+                    departure_time + minutes * 60,
+                    start_penalties,
+                    end_penalties,
+                ): idx
+                for idx, minutes in enumerate(offset_minutes)
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                options[idx] = future.result()
+    else:
+        for idx, minutes in enumerate(offset_minutes):
+            options[idx] = _build_option_response(
                 network,
                 algorithm,
                 start_indices,
@@ -604,12 +819,7 @@ def build_multi_departure_response(
                 departure_time + minutes * 60,
                 start_penalties,
                 end_penalties,
-            ): idx
-            for idx, minutes in enumerate(offset_minutes)
-        }
-        for future in as_completed(futures):
-            idx = futures[future]
-            options[idx] = future.result()
+            )
 
     base = options[0] if options else {
         "departure_time": int(departure_time),
@@ -622,6 +832,8 @@ def build_multi_departure_response(
         "candidate_start_count": len(start_indices),
         "candidate_end_count": len(end_indices),
         **(metadata or {}),
+        "resolver_algorithm": base.get("resolver_algorithm", algorithm),
+        "fallback_used": bool(base.get("fallback_used", False)),
         "transfers": base.get("transfers"),
         "duration_seconds": base.get("duration_seconds"),
         "start_stop_id": base.get("start_stop_id"),
@@ -652,6 +864,7 @@ class PathRequestHandler(BaseHTTPRequestHandler):
         end_stop_id = payload.get("end_stop_id")
         departure_raw = payload.get("departure_time")
         algorithm = payload.get("algorithm", "raptor")
+        offset_minutes_payload = payload.get("offset_minutes")
 
         normalized_start_stop_ids = []
         if isinstance(start_stop_ids, list):
@@ -726,12 +939,29 @@ class PathRequestHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "unsupported_algorithm"})
             return
 
+        offset_minutes = DEFAULT_OFFSET_MINUTES
+        if isinstance(offset_minutes_payload, list):
+            normalized_offsets = []
+            for value in offset_minutes_payload:
+                if isinstance(value, (int, float)):
+                    normalized_offsets.append(int(value))
+                elif isinstance(value, str) and value.strip().lstrip("-").isdigit():
+                    normalized_offsets.append(int(value.strip()))
+                else:
+                    self._send_json(400, {"error": "invalid_offset_minutes"})
+                    return
+            if not normalized_offsets:
+                self._send_json(400, {"error": "invalid_offset_minutes"})
+                return
+            offset_minutes = tuple(normalized_offsets)
+
         response = build_multi_departure_response(
             self.network,
             algorithm,
             start_indices,
             end_indices,
             departure_time,
+            offset_minutes=offset_minutes,
             start_penalties=start_penalties,
             end_penalties=end_penalties,
             metadata=metadata,
