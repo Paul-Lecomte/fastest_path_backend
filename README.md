@@ -81,6 +81,8 @@ Response:
 ```json
 {
   "algorithm": "raptor",
+  "resolver_algorithm": "raptor",
+  "fallback_used": false,
   "transfers": 0,
   "duration_seconds": 200,
   "segments": [
@@ -104,6 +106,10 @@ Response:
   ]
 }
 ```
+
+`resolver_algorithm` indicates the algorithm that actually produced the path.
+When RAPTOR cannot find a path for a query, the service automatically falls back
+to A* then Dijkstra for reliability (`fallback_used=true`).
 
 Segments can include multiple trips when a transfer is required.
 When `start_stop_ids` is provided, all starts are evaluated and the fastest resulting path is returned.
@@ -165,11 +171,17 @@ Optional environment variables:
 - `NEO4J_USER`
 - `NEO4J_PASSWORD`
 - `LOG_LEVEL` (e.g., `DEBUG`, `INFO`)
+- `NETWORK_CACHE_ENABLED` (`true`/`false`, default: `true`)
+- `NETWORK_CACHE_PATH` (default: `.cache/transit_network.pkl`)
+- `NETWORK_CACHE_FORCE_REFRESH` (`true`/`false`, default: `false`)
+- `NETWORK_CACHE_MAX_AGE_SECONDS` (default: `0` meaning no TTL)
 
 You can also create a `.env` file at the project root containing these variables.
 
 Without Neo4j, the server loads a small dummy network for testing.
 Neo4j stop times are parsed from `HH:MM:SS` or numeric values into seconds.
+When cache is enabled, the first successful Neo4j load is persisted to disk and
+subsequent starts reuse the cached network for much faster startup.
 
 ---
 
@@ -196,6 +208,12 @@ Optional RAPTOR performance gate:
 
 ```powershell
 python -m scripts.check_bench --repeat 5 --warmup --max-first 5.0 --max-steady 2.0
+```
+
+Optional long-trip reliability gate:
+
+```powershell
+python -m scripts.check_reliability --sample-size 128 --min-found-rate 0.95 --max-fallback-rate 0.80
 ```
 
 ---
