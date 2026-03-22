@@ -1,7 +1,7 @@
 # This module defines the NetworkLoader class, which is responsible for loading transit network data from a Neo4j database and converting it into a format suitable for pathfinding algorithms. The loader fetches stop times, routes, and stops from the database, processes the data to build an adjacency list representation of the transit network, and returns a TransitNetwork object containing all the relevant information.
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
 import logging
 import pickle
@@ -12,6 +12,12 @@ from neo4j import GraphDatabase
 
 
 logger = logging.getLogger("pathfinding.loader")
+
+
+DEFAULT_TRANSFER_WALK_SPEED_MPS = 1.4
+DEFAULT_TRANSFER_MIN_SECONDS = 30
+DEFAULT_TRANSFER_FALLBACK_SECONDS = 120
+DEFAULT_TRANSFER_MAX_DISTANCE_M = 600.0
 
 
 def parse_time_to_seconds(value) -> int:
@@ -86,6 +92,125 @@ class TransitNetwork:
     route_board_monotonic: np.ndarray
     stop_route_offsets: np.ndarray
     stop_routes: np.ndarray
+    transfer_offsets: np.ndarray = field(default_factory=lambda: np.zeros(1, dtype=np.int64))
+    transfer_neighbors: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int32))
+    transfer_weights: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int64))
+
+
+def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    radius_earth_m = 6371000.0
+    phi1 = np.radians(lat1)
+    phi2 = np.radians(lat2)
+    dphi = np.radians(lat2 - lat1)
+    dlambda = np.radians(lon2 - lon1)
+    sin_half_dphi = np.sin(dphi / 2.0)
+    sin_half_dlambda = np.sin(dlambda / 2.0)
+    a = sin_half_dphi * sin_half_dphi + np.cos(phi1) * np.cos(phi2) * sin_half_dlambda * sin_half_dlambda
+    c = 2.0 * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a))
+    return float(radius_earth_m * c)
+
+
+def _station_key(stop_id: str) -> str:
+    if not isinstance(stop_id, str):
+        return ""
+    text = stop_id.strip()
+    if not text:
+        return ""
+    separator = text.find(":")
+    if separator == -1:
+        return text
+    return text[:separator]
+
+
+def _build_transfers(
+    stop_ids: list[str],
+    stop_lats: np.ndarray,
+    stop_lons: np.ndarray,
+    walk_speed_mps: float = DEFAULT_TRANSFER_WALK_SPEED_MPS,
+    min_seconds: int = DEFAULT_TRANSFER_MIN_SECONDS,
+    fallback_seconds: int = DEFAULT_TRANSFER_FALLBACK_SECONDS,
+    max_distance_m: float = DEFAULT_TRANSFER_MAX_DISTANCE_M,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    n_stops = len(stop_ids)
+    if n_stops <= 0:
+        return np.zeros(1, dtype=np.int64), np.zeros(0, dtype=np.int32), np.zeros(0, dtype=np.int64)
+
+    groups: Dict[str, List[int]] = {}
+    for stop_idx, stop_id in enumerate(stop_ids):
+        key = _station_key(stop_id)
+        if not key:
+            continue
+        groups.setdefault(key, []).append(stop_idx)
+
+    edges: List[Dict[int, int]] = [dict() for _ in range(n_stops)]
+    speed = float(walk_speed_mps) if walk_speed_mps > 0 else DEFAULT_TRANSFER_WALK_SPEED_MPS
+    min_walk = int(min_seconds) if min_seconds > 0 else DEFAULT_TRANSFER_MIN_SECONDS
+    fallback_walk = int(fallback_seconds) if fallback_seconds > 0 else DEFAULT_TRANSFER_FALLBACK_SECONDS
+    max_distance = float(max_distance_m) if max_distance_m > 0 else DEFAULT_TRANSFER_MAX_DISTANCE_M
+
+    for members in groups.values():
+        member_count = len(members)
+        if member_count <= 1:
+            continue
+
+        for source in members:
+            src_lat = float(stop_lats[source]) if source < stop_lats.shape[0] else np.nan
+            src_lon = float(stop_lons[source]) if source < stop_lons.shape[0] else np.nan
+            src_valid = np.isfinite(src_lat) and np.isfinite(src_lon)
+
+            for target in members:
+                if target == source:
+                    continue
+                travel_seconds = fallback_walk
+                tgt_lat = float(stop_lats[target]) if target < stop_lats.shape[0] else np.nan
+                tgt_lon = float(stop_lons[target]) if target < stop_lons.shape[0] else np.nan
+                tgt_valid = np.isfinite(tgt_lat) and np.isfinite(tgt_lon)
+                if src_valid and tgt_valid:
+                    distance_m = _haversine_m(src_lat, src_lon, tgt_lat, tgt_lon)
+                    if distance_m > max_distance:
+                        continue
+                    travel_seconds = max(min_walk, int(distance_m / speed))
+
+                current = edges[source].get(target)
+                if current is None or travel_seconds < current:
+                    edges[source][target] = int(travel_seconds)
+
+    total_edges = sum(len(neighbors) for neighbors in edges)
+    transfer_offsets = np.zeros(n_stops + 1, dtype=np.int64)
+    transfer_neighbors = np.zeros(total_edges, dtype=np.int32)
+    transfer_weights = np.zeros(total_edges, dtype=np.int64)
+
+    cursor = 0
+    for stop_idx in range(n_stops):
+        transfer_offsets[stop_idx] = cursor
+        for neighbor_idx, weight in edges[stop_idx].items():
+            transfer_neighbors[cursor] = int(neighbor_idx)
+            transfer_weights[cursor] = int(weight)
+            cursor += 1
+    transfer_offsets[n_stops] = cursor
+    return transfer_offsets, transfer_neighbors, transfer_weights
+
+
+def _ensure_transfer_graph(network: TransitNetwork) -> TransitNetwork:
+    n_stops = int(network.stops.shape[0])
+    offsets = getattr(network, "transfer_offsets", None)
+    neighbors = getattr(network, "transfer_neighbors", None)
+    weights = getattr(network, "transfer_weights", None)
+
+    if isinstance(offsets, np.ndarray) and isinstance(neighbors, np.ndarray) and isinstance(weights, np.ndarray):
+        expected = n_stops + 1
+        if offsets.shape[0] == expected:
+            return network
+
+    transfer_offsets, transfer_neighbors, transfer_weights = _build_transfers(
+        network.stop_ids,
+        network.stop_lats,
+        network.stop_lons,
+    )
+    network.transfer_offsets = transfer_offsets
+    network.transfer_neighbors = transfer_neighbors
+    network.transfer_weights = transfer_weights
+    return network
 
 
 def load_network_from_cache(cache_path: str, max_age_seconds: int | None = None) -> TransitNetwork | None:
@@ -117,7 +242,7 @@ def load_network_from_cache(cache_path: str, max_age_seconds: int | None = None)
             network.stop_times.shape[0],
             network.routes.shape[0],
         )
-        return network
+        return _ensure_transfer_graph(network)
     except Exception as exc:
         logger.warning("Failed to load network cache path=%s error=%s", path, exc)
         return None
@@ -253,6 +378,12 @@ class NetworkLoader:
             stop_routes,
         ) = _build_routes(stop_times_array, trip_offsets, len(stop_ids))
 
+        transfer_offsets, transfer_neighbors, transfer_weights = _build_transfers(
+            stop_ids,
+            stop_lats,
+            stop_lons,
+        )
+
         return TransitNetwork(
             stops=stops_array,
             stop_times=stop_times_array,
@@ -277,6 +408,9 @@ class NetworkLoader:
             route_board_monotonic=route_board_monotonic,
             stop_route_offsets=stop_route_offsets,
             stop_routes=stop_routes,
+            transfer_offsets=transfer_offsets,
+            transfer_neighbors=transfer_neighbors,
+            transfer_weights=transfer_weights,
         )
 
 
@@ -473,6 +607,12 @@ def build_mock_network() -> TransitNetwork:
         stop_routes,
     ) = _build_routes(stop_times_array, trip_offsets, len(stop_ids))
 
+    transfer_offsets, transfer_neighbors, transfer_weights = _build_transfers(
+        stop_ids,
+        stop_lats,
+        stop_lons,
+    )
+
     return TransitNetwork(
         stops=stops_array,
         stop_times=stop_times_array,
@@ -497,4 +637,7 @@ def build_mock_network() -> TransitNetwork:
         route_board_monotonic=route_board_monotonic,
         stop_route_offsets=stop_route_offsets,
         stop_routes=stop_routes,
+        transfer_offsets=transfer_offsets,
+        transfer_neighbors=transfer_neighbors,
+        transfer_weights=transfer_weights,
     )

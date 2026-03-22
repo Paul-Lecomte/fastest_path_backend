@@ -44,6 +44,9 @@ def _compute_segments(network, algorithm: str, start_stop_id: int, end_stop_id: 
                 network.route_board_monotonic,
                 network.stop_route_offsets,
                 network.stop_routes,
+                network.transfer_offsets,
+                network.transfer_neighbors,
+                network.transfer_weights,
                 start_stop_id,
                 end_stop_id,
                 departure_time,
@@ -205,8 +208,10 @@ class RouteSearchServicer(pathfinding_pb2_grpc.RouteSearchServicer):
 
         response = pathfinding_pb2.PathResponse()
         for trip_id, stop_id, arrival_time in segments:
+            trip_value = int(trip_id)
+            trip_label = "TRANSFER" if trip_value < 0 else self.network.trip_ids[trip_value]
             response.segments.add(
-                trip_id=self.network.trip_ids[trip_id],
+                trip_id=trip_label,
                 stop_id=self.network.stop_ids[stop_id],
                 arrival_time=int(arrival_time),
             )

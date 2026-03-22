@@ -48,6 +48,9 @@ def run_raptor_with_stats(
     route_board_monotonic,
     stop_route_offsets,
     stop_routes,
+    transfer_offsets,
+    transfer_neighbors,
+    transfer_weights,
     start_stop_id: int,
     end_stop_id: int,
     departure_time: int,
@@ -82,6 +85,31 @@ def run_raptor_with_stats(
         rounds_used += 1
         if marked_count == 0:
             break
+
+        transfer_seed_idx = 0
+        while transfer_seed_idx < marked_count:
+            from_stop = marked_list[transfer_seed_idx]
+            transfer_seed_idx += 1
+            base_time = earliest[from_stop]
+            transfer_start = transfer_offsets[from_stop]
+            transfer_end = transfer_offsets[from_stop + 1]
+            for transfer_idx in range(transfer_start, transfer_end):
+                to_stop = transfer_neighbors[transfer_idx]
+                transfer_time = transfer_weights[transfer_idx]
+                arrival_via_transfer = base_time + transfer_time
+                if best_target != inf and arrival_via_transfer >= best_target:
+                    continue
+                if arrival_via_transfer < earliest[to_stop]:
+                    earliest[to_stop] = arrival_via_transfer
+                    pred_stop[to_stop] = from_stop
+                    pred_trip[to_stop] = -2
+                    pred_time[to_stop] = arrival_via_transfer
+                    if marked[to_stop] == 0:
+                        marked[to_stop] = 1
+                        marked_list[marked_count] = to_stop
+                        marked_count += 1
+                    if to_stop == end_stop_id:
+                        best_target = arrival_via_transfer
 
         route_marked_count = 0
         for i in range(marked_count):
@@ -180,6 +208,32 @@ def run_raptor_with_stats(
                     if stop_id == end_stop_id:
                         best_target = arrival_time
 
+        transfer_cursor = 0
+        while transfer_cursor < new_marked_count:
+            from_stop = new_marked_list[transfer_cursor]
+            transfer_cursor += 1
+            base_time = earliest[from_stop]
+            transfer_start = transfer_offsets[from_stop]
+            transfer_end = transfer_offsets[from_stop + 1]
+            for transfer_idx in range(transfer_start, transfer_end):
+                to_stop = transfer_neighbors[transfer_idx]
+                transfer_time = transfer_weights[transfer_idx]
+                arrival_via_transfer = base_time + transfer_time
+                if best_target != inf and arrival_via_transfer >= best_target:
+                    continue
+                if arrival_via_transfer < earliest[to_stop]:
+                    earliest[to_stop] = arrival_via_transfer
+                    pred_stop[to_stop] = from_stop
+                    pred_trip[to_stop] = -2
+                    pred_time[to_stop] = arrival_via_transfer
+                    if new_marked[to_stop] == 0:
+                        new_marked[to_stop] = 1
+                        new_marked_list[new_marked_count] = to_stop
+                        new_marked_count += 1
+                    improved = True
+                    if to_stop == end_stop_id:
+                        best_target = arrival_via_transfer
+
         if not improved:
             break
 
@@ -213,6 +267,9 @@ def run_raptor(
     route_board_monotonic,
     stop_route_offsets,
     stop_routes,
+    transfer_offsets,
+    transfer_neighbors,
+    transfer_weights,
     start_stop_id: int,
     end_stop_id: int,
     departure_time: int,
@@ -230,6 +287,9 @@ def run_raptor(
         route_board_monotonic,
         stop_route_offsets,
         stop_routes,
+        transfer_offsets,
+        transfer_neighbors,
+        transfer_weights,
         start_stop_id,
         end_stop_id,
         departure_time,

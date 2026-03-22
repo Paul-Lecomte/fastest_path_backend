@@ -111,10 +111,17 @@ Response:
 When RAPTOR cannot find a path for a query, the service automatically falls back
 to A* then Dijkstra for reliability (`fallback_used=true`).
 
+For RAPTOR requests, each option now includes `raptor_diagnostics` with round-cap
+attempt metadata and no-path reasons (`no_path_reason`) to help debug difficult
+OD pairs and long-transfer failures.
+
 Segments can include multiple trips when a transfer is required.
 When `start_stop_ids` is provided, all starts are evaluated and the fastest resulting path is returned.
 When `origin` is provided, nearby stops are selected automatically and scored with walking access time.
 When `destination` is provided, nearby destination stops are selected automatically and scored with walking egress time.
+When RAPTOR initially finds no path, the HTTP resolver can expand origin/destination
+candidates in bounded tiers (respecting `max_candidates`) to recover long-transfer
+itineraries while keeping search cost constrained.
 Large numeric `departure_time` values (Unix timestamps) are normalized to seconds-of-day.
 If no path is found with the selected algorithm, the HTTP endpoint expands nearby start stops to improve route discovery.
 

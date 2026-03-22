@@ -11,6 +11,7 @@ from src.loader import (
     STOP_TIMES_DTYPE,
     _build_adjacency,
     _build_routes,
+    _build_transfers,
     build_mock_network,
 )
 from src.solver import build_path, build_path_dijkstra, run_dijkstra_fast, run_raptor, run_astar_fast
@@ -72,6 +73,12 @@ def _build_linear_transfer_network(stop_count: int = 12) -> TransitNetwork:
     stop_lats = np.full(len(stop_ids), np.nan, dtype=np.float64)
     stop_lons = np.full(len(stop_ids), np.nan, dtype=np.float64)
 
+    transfer_offsets, transfer_neighbors, transfer_weights = _build_transfers(
+        stop_ids,
+        stop_lats,
+        stop_lons,
+    )
+
     return TransitNetwork(
         stops=stops_array,
         stop_times=stop_times_array,
@@ -96,6 +103,89 @@ def _build_linear_transfer_network(stop_count: int = 12) -> TransitNetwork:
         route_board_monotonic=route_board_monotonic,
         stop_route_offsets=stop_route_offsets,
         stop_routes=stop_routes,
+        transfer_offsets=transfer_offsets,
+        transfer_neighbors=transfer_neighbors,
+        transfer_weights=transfer_weights,
+    )
+
+
+def _build_destination_trap_network() -> TransitNetwork:
+    stop_ids = ["A", "B", "C", "D"]
+    trip_ids = ["T0"]
+
+    stops_array = np.zeros(len(stop_ids), dtype=STOPS_DTYPE)
+    for i in range(len(stop_ids)):
+        stops_array[i] = (i, i)
+
+    stop_times_array = np.array(
+        [
+            (0, 0, 1000, 1),
+            (1, 0, 1050, 2),
+            (2, 0, 1100, 3),
+        ],
+        dtype=STOP_TIMES_DTYPE,
+    )
+
+    routes_array = np.zeros(len(trip_ids), dtype=ROUTES_DTYPE)
+    routes_array[0] = (0, 0)
+
+    trip_offsets = np.array([0, 3], dtype=np.int64)
+
+    adj_offsets, adj_neighbors, adj_weights, adj_trip_ids = _build_adjacency(
+        stop_times_array,
+        trip_offsets,
+        len(stop_ids),
+    )
+
+    (
+        route_stop_offsets,
+        route_stops,
+        route_trip_offsets,
+        route_trips,
+        route_board_offsets,
+        route_board_times,
+        route_board_monotonic,
+        stop_route_offsets,
+        stop_routes,
+    ) = _build_routes(stop_times_array, trip_offsets, len(stop_ids))
+
+    stop_id_index = {value: idx for idx, value in enumerate(stop_ids)}
+    trip_id_index = {value: idx for idx, value in enumerate(trip_ids)}
+    stop_lats = np.array([46.5, 46.51, 46.52, 46.52005], dtype=np.float64)
+    stop_lons = np.array([6.6, 6.61, 6.62, 6.62005], dtype=np.float64)
+    transfer_offsets, transfer_neighbors, transfer_weights = _build_transfers(
+        stop_ids,
+        stop_lats,
+        stop_lons,
+    )
+
+    return TransitNetwork(
+        stops=stops_array,
+        stop_times=stop_times_array,
+        routes=routes_array,
+        stop_id_index=stop_id_index,
+        trip_id_index=trip_id_index,
+        stop_ids=stop_ids,
+        stop_lats=stop_lats,
+        stop_lons=stop_lons,
+        trip_ids=trip_ids,
+        trip_offsets=trip_offsets,
+        adj_offsets=adj_offsets,
+        adj_neighbors=adj_neighbors,
+        adj_weights=adj_weights,
+        adj_trip_ids=adj_trip_ids,
+        route_stop_offsets=route_stop_offsets,
+        route_stops=route_stops,
+        route_trip_offsets=route_trip_offsets,
+        route_trips=route_trips,
+        route_board_offsets=route_board_offsets,
+        route_board_times=route_board_times,
+        route_board_monotonic=route_board_monotonic,
+        stop_route_offsets=stop_route_offsets,
+        stop_routes=stop_routes,
+        transfer_offsets=transfer_offsets,
+        transfer_neighbors=transfer_neighbors,
+        transfer_weights=transfer_weights,
     )
 
 
@@ -113,6 +203,9 @@ def test_smoke_mock_network():
         network.route_board_monotonic,
         network.stop_route_offsets,
         network.stop_routes,
+        network.transfer_offsets,
+        network.transfer_neighbors,
+        network.transfer_weights,
         0,
         2,
         900,
@@ -383,3 +476,50 @@ def test_raptor_option_exposes_resolver_metadata():
     option = response["options"][0]
     assert "resolver_algorithm" in option
     assert "fallback_used" in option
+
+
+def test_raptor_option_exposes_diagnostics_on_no_path():
+    network = build_mock_network()
+    response = build_multi_departure_response(
+        network,
+        "raptor",
+        [network.stop_id_index["A"]],
+        network.stop_id_index["C"],
+        2000,
+        offset_minutes=(0,),
+    )
+
+    diagnostics = response["options"][0]["raptor_diagnostics"]
+    assert diagnostics is not None
+    assert diagnostics["attempt_caps"]
+    assert "no_path_reason" in diagnostics
+
+
+def test_raptor_adaptive_destination_expansion_finds_path():
+    network = _build_destination_trap_network()
+    start_indices, start_penalties, origin_metadata = _select_starts_from_origin(
+        network,
+        {"lat": 46.5, "lon": 6.6, "radius_m": 100, "max_candidates": 1},
+    )
+    end_indices, end_penalties, destination_metadata = _select_ends_from_destination(
+        network,
+        {"lat": 46.52005, "lon": 6.62005, "radius_m": 5, "max_candidates": 2},
+    )
+
+    response = build_multi_departure_response(
+        network,
+        "raptor",
+        start_indices,
+        end_indices,
+        900,
+        offset_minutes=(0,),
+        start_penalties=start_penalties,
+        end_penalties=end_penalties,
+        metadata={**origin_metadata, **destination_metadata},
+    )
+
+    assert response["segments"]
+    diagnostics = response["options"][0]["raptor_diagnostics"]
+    assert diagnostics is not None
+    assert 1 in diagnostics["attempted_end_candidates"]
+    assert 2 in diagnostics["attempted_end_candidates"]

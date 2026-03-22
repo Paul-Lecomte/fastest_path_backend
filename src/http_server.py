@@ -35,17 +35,172 @@ DEFAULT_WALK_SPEED_MPS = 1.4
 UNIX_TIMESTAMP_MIN_SECONDS = 946684800
 DEFAULT_RAPTOR_ROUNDS_MIN = 8
 DEFAULT_RAPTOR_ROUNDS_MAX = 64
+DEFAULT_ADAPTIVE_EXPANSION_MAX_TIERS = 4
+
+
+def _snapshot_indices(values: list[int], limit: int = 64) -> list[int]:
+    if len(values) <= limit:
+        return [int(item) for item in values]
+    return [int(item) for item in values[:limit]]
+
+
+def _collect_candidate_counts(
+    diagnostics: dict[str, Any] | None,
+) -> tuple[set[int], set[int]]:
+    start_counts: set[int] = set()
+    end_counts: set[int] = set()
+    if not diagnostics:
+        return start_counts, end_counts
+
+    for run in diagnostics.get("runs", []):
+        try:
+            start_counts.add(int(run.get("start_candidates", 0)))
+            end_counts.add(int(run.get("end_candidates", 0)))
+        except (TypeError, ValueError):
+            continue
+    return start_counts, end_counts
+
+
+def _build_no_path_reason(
+    diagnostics: dict[str, Any] | None,
+    start_counts: set[int],
+    end_counts: set[int],
+) -> str:
+    if not diagnostics or not diagnostics.get("runs"):
+        return "no_attempt"
+    if len(end_counts) > 1:
+        return "no_path_after_destination_expansion"
+    if len(start_counts) > 1:
+        return "no_path_after_origin_expansion"
+    return "no_path_within_candidate_budget"
+
+
+def _merge_raptor_diagnostics(
+    base: dict[str, Any] | None,
+    current: dict[str, Any] | None,
+) -> dict[str, Any]:
+    merged: dict[str, Any] = {
+        "runs": [],
+        "attempt_caps": [],
+        "max_rounds_reached": False,
+        "rounds_used_max": 0,
+    }
+
+    for payload in (base, current):
+        if not payload:
+            continue
+        merged["runs"].extend(payload.get("runs", []))
+        merged["attempt_caps"].extend(payload.get("attempt_caps", []))
+        merged["max_rounds_reached"] = bool(merged["max_rounds_reached"] or payload.get("max_rounds_reached", False))
+        payload_rounds = int(payload.get("rounds_used_max", 0))
+        if payload_rounds > int(merged["rounds_used_max"]):
+            merged["rounds_used_max"] = payload_rounds
+
+    merged["attempt_caps"] = sorted(set(int(value) for value in merged["attempt_caps"]))
+    return merged
+
+
+def _candidate_tiers(
+    count: int,
+    start_count: int,
+    max_tiers: int = DEFAULT_ADAPTIVE_EXPANSION_MAX_TIERS,
+) -> tuple[int, ...]:
+    if count <= 0 or start_count <= 0:
+        return ()
+    if count <= start_count:
+        return (int(count),)
+    tiers = []
+    current = int(start_count)
+    while current < count and len(tiers) + 1 < max_tiers:
+        tiers.append(current)
+        current = min(count, current * 2)
+    tiers.append(count)
+    return tuple(dict.fromkeys(int(value) for value in tiers))
+
+
+def _sorted_stops_by_distance(
+    network: TransitNetwork,
+    lat: float,
+    lon: float,
+):
+    valid_mask = np.isfinite(network.stop_lats) & np.isfinite(network.stop_lons)
+    valid_indices = np.where(valid_mask)[0]
+    if valid_indices.size == 0:
+        return np.array([], dtype=np.int64), np.array([], dtype=np.float64)
+
+    distances = _haversine_distance_m(
+        lat,
+        lon,
+        network.stop_lats[valid_indices],
+        network.stop_lons[valid_indices],
+    )
+    order = np.argsort(distances)
+    return valid_indices[order], distances[order]
+
+
+def _expand_candidates_tiered(
+    network: TransitNetwork,
+    seed_indices: list[int],
+    anchor: dict[str, Any] | None,
+    candidate_type: str,
+):
+    unique_seed = [int(value) for value in dict.fromkeys(seed_indices)]
+    if not unique_seed:
+        return [unique_seed]
+
+    if not isinstance(anchor, dict):
+        return [unique_seed]
+
+    lat = _to_float(anchor.get("lat"))
+    lon = _to_float(anchor.get("lon"))
+    if lat is None or lon is None:
+        return [unique_seed]
+
+    sorted_indices, _ = _sorted_stops_by_distance(network, lat, lon)
+    if sorted_indices.size == 0:
+        return [unique_seed]
+
+    max_candidates = _to_int(anchor.get("max_candidates"), len(unique_seed))
+    if max_candidates <= 0:
+        max_candidates = len(unique_seed)
+
+    tier_sets: list[list[int]] = [unique_seed]
+    for size in _candidate_tiers(max_candidates, len(unique_seed)):
+        selected = [int(value) for value in sorted_indices[:size].tolist()]
+        if not selected:
+            continue
+        if selected == tier_sets[-1]:
+            continue
+        tier_sets.append(selected)
+
+    logger.debug(
+        "Adaptive %s tiers base=%s tiers=%s",
+        candidate_type,
+        len(unique_seed),
+        [len(values) for values in tier_sets],
+    )
+    return tier_sets
 
 
 def _count_transfers(segments) -> int:
     if not segments:
         return 0
     transfers = 0
-    current_trip = segments[0][0]
+    current_trip = None
+    for trip_id, _, _ in segments:
+        if int(trip_id) >= 0:
+            current_trip = int(trip_id)
+            break
+    if current_trip is None:
+        return 0
+
     for trip_id, _, _ in segments[1:]:
-        if trip_id != current_trip:
+        trip_value = int(trip_id)
+        if trip_value < 0:
+            continue
+        if trip_value != current_trip:
             transfers += 1
-            current_trip = trip_id
+            current_trip = trip_value
     return transfers
 
 
@@ -113,8 +268,13 @@ def _segment_coordinates(network: TransitNetwork, stop_id: int) -> tuple[float |
 
 def _segment_payload(network: TransitNetwork, trip_id: int, stop_id: int, arrival_time: int) -> dict[str, Any]:
     lat, lon = _segment_coordinates(network, stop_id)
+    trip_value = int(trip_id)
+    if trip_value < 0:
+        trip_label = "TRANSFER"
+    else:
+        trip_label = network.trip_ids[trip_value]
     return {
-        "trip_id": network.trip_ids[trip_id],
+        "trip_id": trip_label,
         "stop_id": network.stop_ids[stop_id],
         "arrival_time": int(arrival_time),
         "lat": lat,
@@ -307,6 +467,9 @@ def _warmup_raptor(network: TransitNetwork) -> None:
         network.route_board_monotonic,
         network.stop_route_offsets,
         network.stop_routes,
+        network.transfer_offsets,
+        network.transfer_neighbors,
+        network.transfer_weights,
         start_idx,
         end_idx,
         0,
@@ -318,7 +481,10 @@ def _warmup_raptor(network: TransitNetwork) -> None:
 
 def _raptor_round_budgets(network: TransitNetwork) -> tuple[int, ...]:
     n_stops = int(network.stop_route_offsets.shape[0] - 1)
-    adaptive_cap = min(DEFAULT_RAPTOR_ROUNDS_MAX, max(DEFAULT_RAPTOR_ROUNDS_MIN, int(np.sqrt(max(1, n_stops))) + 8))
+    adaptive_cap = min(
+        DEFAULT_RAPTOR_ROUNDS_MAX,
+        max(DEFAULT_RAPTOR_ROUNDS_MIN, 24, int(np.sqrt(max(1, n_stops))) + 8),
+    )
     budgets = []
     current = DEFAULT_RAPTOR_ROUNDS_MIN
     while current < adaptive_cap:
@@ -329,11 +495,7 @@ def _raptor_round_budgets(network: TransitNetwork) -> tuple[int, ...]:
 
 
 def _algorithm_sequence(primary: str) -> tuple[str, ...]:
-    if primary == "raptor":
-        return ("raptor", "astar", "dijkstra")
-    if primary == "astar":
-        return ("astar", "dijkstra")
-    return ("dijkstra",)
+    return (primary,)
 
 
 def _compute_segments(
@@ -359,6 +521,9 @@ def _compute_segments(
                 network.route_board_monotonic,
                 network.stop_route_offsets,
                 network.stop_routes,
+                network.transfer_offsets,
+                network.transfer_neighbors,
+                network.transfer_weights,
                 start_idx,
                 end_idx,
                 departure_time,
@@ -572,9 +737,14 @@ def _find_best_segments_for_od_candidates_raptor(
     start_penalties: dict[int, int] | None = None,
     end_penalties: dict[int, int] | None = None,
 ):
+    budget_caps = list(_raptor_round_budgets(network))
+
     def compute_for_start(start_idx: int):
         attempt_summaries = []
-        for max_rounds in _raptor_round_budgets(network):
+        attempt_records = []
+        max_rounds_reached = False
+        rounds_used_max = 0
+        for max_rounds in budget_caps:
             started = time.perf_counter()
             earliest, pred_stop, pred_trip, pred_time, rounds_used, marked_count, _ = run_raptor_with_stats(
                 network.stop_times,
@@ -588,6 +758,9 @@ def _find_best_segments_for_od_candidates_raptor(
                 network.route_board_monotonic,
                 network.stop_route_offsets,
                 network.stop_routes,
+                network.transfer_offsets,
+                network.transfer_neighbors,
+                network.transfer_weights,
                 int(start_idx),
                 -1,
                 departure_time,
@@ -595,8 +768,21 @@ def _find_best_segments_for_od_candidates_raptor(
             )
             best_end, best_end_score = _best_end_from_earliest(earliest, end_indices, end_penalties)
             elapsed_ms = (time.perf_counter() - started) * 1000.0
+            rounds_value = int(rounds_used)
+            rounds_used_max = max(rounds_used_max, rounds_value)
+            if rounds_value >= int(max_rounds):
+                max_rounds_reached = True
             attempt_summaries.append(
-                f"cap={max_rounds} used={int(rounds_used)} marked={int(marked_count)} ms={elapsed_ms:.1f} best_end={best_end}"
+                f"cap={max_rounds} used={rounds_value} marked={int(marked_count)} ms={elapsed_ms:.1f} best_end={best_end}"
+            )
+            attempt_records.append(
+                {
+                    "cap": int(max_rounds),
+                    "rounds_used": rounds_value,
+                    "marked_count": int(marked_count),
+                    "best_end_idx": None if best_end is None else int(best_end),
+                    "elapsed_ms": round(float(elapsed_ms), 3),
+                }
             )
 
             if best_end is None:
@@ -622,15 +808,44 @@ def _find_best_segments_for_od_candidates_raptor(
                 best_end,
                 " | ".join(attempt_summaries),
             )
-            return segments, int(start_idx), best_end, total_score
+            return (
+                segments,
+                int(start_idx),
+                best_end,
+                total_score,
+                {
+                    "success": True,
+                    "start_idx": int(start_idx),
+                    "end_idx": int(best_end),
+                    "start_candidates": int(len(start_indices)),
+                    "end_candidates": int(len(end_indices)),
+                    "attempts": attempt_records,
+                    "max_rounds_reached": bool(max_rounds_reached),
+                    "rounds_used_max": int(rounds_used_max),
+                },
+            )
 
         logger.info("RAPTOR multi-end no-path start=%s attempts=%s", start_idx, " | ".join(attempt_summaries))
-        return [], None, None, None
+        return (
+            [],
+            None,
+            None,
+            None,
+            {
+                "success": False,
+                "start_idx": int(start_idx),
+                "end_idx": None,
+                "start_candidates": int(len(start_indices)),
+                "end_candidates": int(len(end_indices)),
+                "attempts": attempt_records,
+                "max_rounds_reached": bool(max_rounds_reached),
+                "rounds_used_max": int(rounds_used_max),
+            },
+        )
 
     if len(start_indices) == 1:
-        return compute_for_start(start_indices[0])
-
-    if not numba_enabled():
+        results = [compute_for_start(start_indices[0])]
+    elif not numba_enabled():
         results = [compute_for_start(start_idx) for start_idx in start_indices]
     else:
         with ThreadPoolExecutor(max_workers=min(len(start_indices), 16)) as pool:
@@ -641,7 +856,14 @@ def _find_best_segments_for_od_candidates_raptor(
     best_start = None
     best_end = None
     best_score = None
-    for segments, start_idx, end_idx, score in results:
+    diagnostics_runs = []
+    max_rounds_reached = False
+    rounds_used_max = 0
+    for segments, start_idx, end_idx, score, diag in results:
+        if diag:
+            diagnostics_runs.append(diag)
+            max_rounds_reached = bool(max_rounds_reached or diag.get("max_rounds_reached", False))
+            rounds_used_max = max(rounds_used_max, int(diag.get("rounds_used_max", 0)))
         if not segments or start_idx is None or end_idx is None or score is None:
             continue
         if best_score is None or score < best_score:
@@ -650,7 +872,13 @@ def _find_best_segments_for_od_candidates_raptor(
             best_start = int(start_idx)
             best_end = int(end_idx)
 
-    return best_segments, best_start, best_end, best_score
+    diagnostics = {
+        "runs": diagnostics_runs,
+        "attempt_caps": [int(value) for value in budget_caps],
+        "max_rounds_reached": bool(max_rounds_reached),
+        "rounds_used_max": int(rounds_used_max),
+    }
+    return best_segments, best_start, best_end, best_score, diagnostics
 
 
 def _find_best_segments_for_od_candidates(
@@ -697,7 +925,7 @@ def _find_best_segments_for_od_candidates(
             best_start = int(start_idx)
             best_end = int(end_idx)
 
-    return best_segments, best_start, best_end, best_score
+    return best_segments, best_start, best_end, best_score, None
 
 
 def _build_option_response(
@@ -708,6 +936,8 @@ def _build_option_response(
     departure_time: int,
     start_penalties: dict[int, int] | None = None,
     end_penalties: dict[int, int] | None = None,
+    origin_anchor: dict[str, Any] | None = None,
+    destination_anchor: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     algorithms = _algorithm_sequence(algorithm)
 
@@ -715,8 +945,9 @@ def _build_option_response(
     best_start = None
     best_end = None
     resolved_algorithm = algorithm
+    raptor_diagnostics = None
     for selected_algorithm in algorithms:
-        segments, best_start, best_end, _ = _find_best_segments_for_od_candidates(
+        segments, best_start, best_end, _, diagnostics = _find_best_segments_for_od_candidates(
             network,
             selected_algorithm,
             start_indices,
@@ -725,34 +956,77 @@ def _build_option_response(
             start_penalties,
             end_penalties,
         )
+        if selected_algorithm == "raptor":
+            raptor_diagnostics = _merge_raptor_diagnostics(raptor_diagnostics, diagnostics)
+
+            if not segments:
+                destination_tiers = _expand_candidates_tiered(
+                    network,
+                    end_indices,
+                    destination_anchor,
+                    "destination",
+                )
+                for tier_idx, tier_end_indices in enumerate(destination_tiers[1:], start=1):
+                    segments, best_start, best_end, _, tier_diagnostics = _find_best_segments_for_od_candidates(
+                        network,
+                        selected_algorithm,
+                        start_indices,
+                        tier_end_indices,
+                        departure_time,
+                        start_penalties,
+                        end_penalties,
+                    )
+                    raptor_diagnostics = _merge_raptor_diagnostics(raptor_diagnostics, tier_diagnostics)
+                    if segments:
+                        logger.info(
+                            "RAPTOR adaptive destination expansion hit tier=%s end_candidates=%s",
+                            tier_idx,
+                            len(tier_end_indices),
+                        )
+                        break
+
+            if not segments:
+                origin_tiers = _expand_candidates_tiered(
+                    network,
+                    start_indices,
+                    origin_anchor,
+                    "origin",
+                )
+                for tier_idx, tier_start_indices in enumerate(origin_tiers[1:], start=1):
+                    segments, best_start, best_end, _, tier_diagnostics = _find_best_segments_for_od_candidates(
+                        network,
+                        selected_algorithm,
+                        tier_start_indices,
+                        end_indices,
+                        departure_time,
+                        start_penalties,
+                        end_penalties,
+                    )
+                    raptor_diagnostics = _merge_raptor_diagnostics(raptor_diagnostics, tier_diagnostics)
+                    if segments:
+                        logger.info(
+                            "RAPTOR adaptive origin expansion hit tier=%s start_candidates=%s",
+                            tier_idx,
+                            len(tier_start_indices),
+                        )
+                        break
+
+            if raptor_diagnostics is not None:
+                start_counts, end_counts = _collect_candidate_counts(raptor_diagnostics)
+                raptor_diagnostics["attempted_start_candidates"] = sorted(start_counts)
+                raptor_diagnostics["attempted_end_candidates"] = sorted(end_counts)
+                raptor_diagnostics["start_indices_snapshot"] = _snapshot_indices(start_indices)
+                raptor_diagnostics["end_indices_snapshot"] = _snapshot_indices(end_indices)
+                if not segments:
+                    raptor_diagnostics["no_path_reason"] = _build_no_path_reason(
+                        raptor_diagnostics,
+                        start_counts,
+                        end_counts,
+                    )
+
         if segments:
             resolved_algorithm = selected_algorithm
             break
-
-    if not segments:
-        expanded_start_indices = _expand_start_indices(network, start_indices)
-        if len(expanded_start_indices) > len(start_indices):
-            for selected_algorithm in algorithms:
-                segments, best_start, best_end, _ = _find_best_segments_for_od_candidates(
-                    network,
-                    selected_algorithm,
-                    expanded_start_indices,
-                    end_indices,
-                    departure_time,
-                    start_penalties,
-                    end_penalties,
-                )
-                if segments:
-                    resolved_algorithm = selected_algorithm
-                    logger.info(
-                        "Route fallback used algorithm=%s resolved=%s start_expansion=%s original_starts=%s",
-                        algorithm,
-                        selected_algorithm,
-                        len(expanded_start_indices),
-                        len(start_indices),
-                    )
-                    break
-                
 
     if segments is None:
         return {}
@@ -770,6 +1044,7 @@ def _build_option_response(
             _segment_payload(network, trip_id, stop_id, arrival_time)
             for trip_id, stop_id, arrival_time in segments
         ],
+        "raptor_diagnostics": raptor_diagnostics if algorithm == "raptor" else None,
     }
 
 
@@ -789,6 +1064,9 @@ def build_multi_departure_response(
     else:
         end_indices = [int(end_idx)]
 
+    origin_anchor = metadata.get("origin") if isinstance(metadata, dict) else None
+    destination_anchor = metadata.get("destination") if isinstance(metadata, dict) else None
+
     options = [None] * len(offset_minutes)
     use_parallel_offsets = not (algorithm == "raptor" and not numba_enabled())
     if use_parallel_offsets:
@@ -803,6 +1081,8 @@ def build_multi_departure_response(
                     departure_time + minutes * 60,
                     start_penalties,
                     end_penalties,
+                    origin_anchor,
+                    destination_anchor,
                 ): idx
                 for idx, minutes in enumerate(offset_minutes)
             }
@@ -819,6 +1099,8 @@ def build_multi_departure_response(
                 departure_time + minutes * 60,
                 start_penalties,
                 end_penalties,
+                origin_anchor,
+                destination_anchor,
             )
 
     base = options[0] if options else {
@@ -841,6 +1123,7 @@ def build_multi_departure_response(
         "end_stop_id": base.get("end_stop_id"),
         "egress_walk_seconds": base.get("egress_walk_seconds"),
         "segments": base.get("segments"),
+        "raptor_diagnostics": base.get("raptor_diagnostics"),
         "options": options,
     }
 
