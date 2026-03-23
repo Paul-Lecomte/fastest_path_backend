@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+import heapq
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from datetime import datetime, timezone
@@ -37,15 +38,16 @@ DEFAULT_START_EXPANSION_HOPS = 2
 DEFAULT_START_EXPANSION_MAX_STOPS = 256
 DEFAULT_ORIGIN_RADIUS_M = 1000.0
 DEFAULT_ORIGIN_MAX_CANDIDATES = 12
-DEFAULT_ORIGIN_SEED_CANDIDATES = 1
-DEFAULT_DESTINATION_SEED_CANDIDATES = 1
+DEFAULT_ORIGIN_SEED_CANDIDATES = 2
+DEFAULT_DESTINATION_SEED_CANDIDATES = 6
 DEFAULT_WALK_SPEED_MPS = 1.4
 UNIX_TIMESTAMP_MIN_SECONDS = 946684800
 DEFAULT_RAPTOR_ROUNDS_MIN = 8
 DEFAULT_RAPTOR_ROUNDS_MAX = 64
 DEFAULT_ADAPTIVE_EXPANSION_MAX_TIERS = 4
-DEFAULT_RAPTOR_TRANSFER_PENALTY_SECONDS = 1500
-DEFAULT_OPTION_TRANSFER_PENALTY_SECONDS = 900
+DEFAULT_RAPTOR_TRANSFER_PENALTY_SECONDS = 3600
+DEFAULT_OPTION_TRANSFER_PENALTY_SECONDS = 3600
+DEFAULT_MAX_TRANSFERS = 4
 
 
 def _snapshot_indices(values: list[int], limit: int = 64) -> list[int]:
@@ -148,6 +150,31 @@ def _sorted_stops_by_distance(
     return valid_indices[order], distances[order]
 
 
+def _rank_origin_candidates_by_connectivity(
+    network: TransitNetwork,
+    candidate_indices: np.ndarray,
+    candidate_distances: np.ndarray,
+    walk_speed_mps: float,
+) -> np.ndarray:
+    if candidate_indices.size <= 1:
+        return candidate_indices
+
+    n_stops = int(network.stop_route_offsets.shape[0] - 1)
+    ranked_payload: list[tuple[float, float, int]] = []
+    for stop_idx, distance_m in zip(candidate_indices.tolist(), candidate_distances.tolist()):
+        route_degree = 0
+        if 0 <= int(stop_idx) < n_stops:
+            row_start = int(network.stop_route_offsets[int(stop_idx)])
+            row_end = int(network.stop_route_offsets[int(stop_idx) + 1])
+            route_degree = max(0, row_end - row_start)
+        walk_seconds = float(distance_m / max(0.5, float(walk_speed_mps)))
+        utility = float(route_degree) * 600.0 - walk_seconds
+        ranked_payload.append((utility, float(distance_m), int(stop_idx)))
+
+    ranked_payload.sort(key=lambda item: (-item[0], item[1], item[2]))
+    return np.array([item[2] for item in ranked_payload], dtype=np.int64)
+
+
 def _expand_candidates_tiered(
     network: TransitNetwork,
     seed_indices: list[int],
@@ -218,8 +245,12 @@ def _score_segments_with_transfer_penalty(
     segments,
     base_score: int,
     transfer_penalty_seconds: int = DEFAULT_OPTION_TRANSFER_PENALTY_SECONDS,
+    max_transfers: int = DEFAULT_MAX_TRANSFERS,
 ) -> int:
-    return int(base_score) + int(_count_transfers(segments)) * int(transfer_penalty_seconds)
+    transfer_count = int(_count_transfers(segments))
+    if transfer_count > int(max_transfers):
+        return int(2**62 - 1)
+    return int(base_score) + transfer_count * int(transfer_penalty_seconds)
 
 
 def _first_transit_trip_signature(option: dict[str, Any]) -> tuple[str, str | None]:
@@ -352,6 +383,187 @@ def _haversine_distance_m(lat1: float, lon1: float, lat2: np.ndarray, lon2: np.n
     return radius_earth_m * c
 
 
+def _stop_station_id(network: TransitNetwork, stop_id: int) -> int:
+    mapping = getattr(network, "stop_station_ids", None)
+    if isinstance(mapping, np.ndarray) and 0 <= int(stop_id) < mapping.shape[0]:
+        return int(mapping[int(stop_id)])
+    stop_text = network.stop_ids[int(stop_id)] if 0 <= int(stop_id) < len(network.stop_ids) else ""
+    key = stop_text.split(":", 1)[0] if isinstance(stop_text, str) else ""
+    if not key:
+        return int(stop_id)
+    station_keys = getattr(network, "station_keys", None)
+    if isinstance(station_keys, list):
+        try:
+            return int(station_keys.index(key))
+        except ValueError:
+            return int(stop_id)
+    return int(stop_id)
+
+
+def _nearest_hub_station(network: TransitNetwork, station_id: int) -> int:
+    hub_indices = getattr(network, "hub_station_indices", None)
+    station_lats = getattr(network, "station_lats", None)
+    station_lons = getattr(network, "station_lons", None)
+    if not isinstance(hub_indices, np.ndarray) or hub_indices.size == 0:
+        return int(station_id)
+    if not isinstance(station_lats, np.ndarray) or not isinstance(station_lons, np.ndarray):
+        return int(station_id)
+    if 0 <= int(station_id) < hub_indices.shape[0] and int(station_id) in set(hub_indices.tolist()):
+        return int(station_id)
+
+    if not (0 <= int(station_id) < station_lats.shape[0]):
+        return int(hub_indices[0])
+    lat = float(station_lats[int(station_id)])
+    lon = float(station_lons[int(station_id)])
+    if not (np.isfinite(lat) and np.isfinite(lon)):
+        return int(hub_indices[0])
+
+    hub_lats = station_lats[hub_indices]
+    hub_lons = station_lons[hub_indices]
+    valid = np.isfinite(hub_lats) & np.isfinite(hub_lons)
+    if not np.any(valid):
+        return int(hub_indices[0])
+    valid_hubs = hub_indices[valid]
+    distances = _haversine_distance_m(lat, lon, hub_lats[valid], hub_lons[valid])
+    best = int(np.argmin(distances))
+    return int(valid_hubs[best])
+
+
+def _station_path_lexicographic(
+    network: TransitNetwork,
+    start_station: int,
+    end_station: int,
+    max_hops: int,
+) -> list[int]:
+    offsets = getattr(network, "station_adj_offsets", None)
+    neighbors = getattr(network, "station_adj_neighbors", None)
+    weights = getattr(network, "station_adj_weights", None)
+    if not (isinstance(offsets, np.ndarray) and isinstance(neighbors, np.ndarray) and isinstance(weights, np.ndarray)):
+        return []
+    station_count = int(offsets.shape[0] - 1)
+    if station_count <= 0:
+        return []
+    if not (0 <= int(start_station) < station_count and 0 <= int(end_station) < station_count):
+        return []
+
+    inf = int(2**62 - 1)
+    best_hops = np.full(station_count, np.int64(inf), dtype=np.int64)
+    best_time = np.full(station_count, np.int64(inf), dtype=np.int64)
+    predecessor = np.full(station_count, -1, dtype=np.int64)
+
+    start_station = int(start_station)
+    end_station = int(end_station)
+    best_hops[start_station] = 0
+    best_time[start_station] = 0
+
+    queue: list[tuple[int, int, int]] = [(0, 0, start_station)]
+    while queue:
+        hops, total_time, station = heapq.heappop(queue)
+        if hops > int(best_hops[station]):
+            continue
+        if hops == int(best_hops[station]) and total_time > int(best_time[station]):
+            continue
+        if station == end_station:
+            break
+        if hops >= int(max_hops):
+            continue
+
+        row_start = int(offsets[station])
+        row_end = int(offsets[station + 1])
+        for idx in range(row_start, row_end):
+            target = int(neighbors[idx])
+            next_hops = hops + 1
+            next_time = total_time + int(weights[idx])
+            should_update = (
+                next_hops < int(best_hops[target])
+                or (next_hops == int(best_hops[target]) and next_time < int(best_time[target]))
+            )
+            if should_update:
+                best_hops[target] = next_hops
+                best_time[target] = next_time
+                predecessor[target] = station
+                heapq.heappush(queue, (next_hops, next_time, target))
+
+    if int(best_hops[end_station]) >= inf:
+        return []
+
+    path = [end_station]
+    current = end_station
+    while current != start_station:
+        current = int(predecessor[current])
+        if current < 0:
+            return []
+        path.append(current)
+    path.reverse()
+    return [int(value) for value in path]
+
+
+def _compute_station_backbone(
+    network: TransitNetwork,
+    start_indices: list[int],
+    end_indices: list[int],
+    max_transfers: int,
+) -> tuple[set[int] | None, list[int] | None]:
+    if not start_indices or not end_indices:
+        return None, None
+
+    start_stations = {_stop_station_id(network, stop_id) for stop_id in start_indices}
+    end_stations = {_stop_station_id(network, stop_id) for stop_id in end_indices}
+    if not start_stations or not end_stations:
+        return None, None
+
+    max_hops = max(2, int(max_transfers) + 2)
+    best_path: list[int] | None = None
+    for start_station in start_stations:
+        start_hub = _nearest_hub_station(network, int(start_station))
+        for end_station in end_stations:
+            end_hub = _nearest_hub_station(network, int(end_station))
+            station_path = _station_path_lexicographic(network, start_hub, end_hub, max_hops=max_hops)
+            if not station_path:
+                continue
+            if best_path is None or len(station_path) < len(best_path):
+                best_path = station_path
+
+    if not best_path:
+        return None, None
+
+    whitelist = set(int(station_id) for station_id in best_path)
+    station_adj_offsets = getattr(network, "station_adj_offsets", None)
+    station_adj_neighbors = getattr(network, "station_adj_neighbors", None)
+    if isinstance(station_adj_offsets, np.ndarray) and isinstance(station_adj_neighbors, np.ndarray):
+        for station_id in best_path:
+            row_start = int(station_adj_offsets[int(station_id)])
+            row_end = int(station_adj_offsets[int(station_id) + 1])
+            for idx in range(row_start, row_end):
+                whitelist.add(int(station_adj_neighbors[idx]))
+
+    for station_id in start_stations:
+        whitelist.add(int(station_id))
+    for station_id in end_stations:
+        whitelist.add(int(station_id))
+    return whitelist, best_path
+
+
+def _segments_follow_station_backbone(
+    network: TransitNetwork,
+    segments,
+    whitelist: set[int] | None,
+    max_off_path_stations: int = 2,
+) -> bool:
+    if not segments or not whitelist:
+        return True
+    off_path = set()
+    for trip_id, stop_id, _ in segments:
+        if int(trip_id) < 0:
+            continue
+        station_id = _stop_station_id(network, int(stop_id))
+        if station_id not in whitelist:
+            off_path.add(int(station_id))
+            if len(off_path) > int(max_off_path_stations):
+                return False
+    return True
+
+
 def _segment_coordinates(network: TransitNetwork, stop_id: int) -> tuple[float | None, float | None]:
     lat = float(network.stop_lats[stop_id])
     lon = float(network.stop_lons[stop_id])
@@ -421,14 +633,26 @@ def _select_starts_from_origin(network: TransitNetwork, origin: Any):
         selected_indices_full = sorted_indices[:fallback_count]
         selected_distances_full = sorted_distances[:fallback_count]
 
+    ranked_indices = _rank_origin_candidates_by_connectivity(
+        network,
+        selected_indices_full,
+        selected_distances_full,
+        walk_speed_mps,
+    )
+    distance_by_stop = {
+        int(stop_idx): float(distance_m)
+        for stop_idx, distance_m in zip(selected_indices_full.tolist(), selected_distances_full.tolist())
+    }
+    selected_indices_full = ranked_indices
+
     seed_candidates = _to_int(origin.get("seed_candidates"), min(DEFAULT_ORIGIN_SEED_CANDIDATES, max_candidates))
     seed_candidates = max(1, min(seed_candidates, int(selected_indices_full.size)))
     selected_indices = selected_indices_full[:seed_candidates]
 
     start_indices = [int(value) for value in selected_indices.tolist()]
     start_penalties = {
-        int(stop_idx): int(distance_m / walk_speed_mps)
-        for stop_idx, distance_m in zip(selected_indices_full, selected_distances_full)
+        int(stop_idx): int(distance_by_stop[int(stop_idx)] / walk_speed_mps)
+        for stop_idx in selected_indices_full.tolist()
     }
 
     metadata = {
@@ -780,6 +1004,7 @@ def _find_best_segments_for_starts(
     end_idx: int,
     departure_time: int,
     start_penalties: dict[int, int] | None = None,
+    max_transfers: int = DEFAULT_MAX_TRANSFERS,
 ):
     if len(start_indices) == 1:
         only_start = start_indices[0]
@@ -790,7 +1015,10 @@ def _find_best_segments_for_starts(
         score = _score_segments_with_transfer_penalty(
             segments,
             int(segments[-1][2]) + penalty,
+            max_transfers=max_transfers,
         )
+        if score >= int(2**62 - 1):
+            return [], None, None
         return segments, only_start, score
 
     with ThreadPoolExecutor(max_workers=min(len(start_indices), 16)) as pool:
@@ -817,7 +1045,10 @@ def _find_best_segments_for_starts(
         score = _score_segments_with_transfer_penalty(
             result,
             int(result[-1][2]) + penalty,
+            max_transfers=max_transfers,
         )
+        if score >= int(2**62 - 1):
+            continue
         if best_score is None or score < best_score:
             best_score = score
             best_segments = result
@@ -852,6 +1083,7 @@ def _find_best_segments_for_od_candidates_raptor(
     departure_time: int,
     start_penalties: dict[int, int] | None = None,
     end_penalties: dict[int, int] | None = None,
+    max_transfers: int = DEFAULT_MAX_TRANSFERS,
 ):
     budget_caps = list(_raptor_round_budgets(network))
 
@@ -922,7 +1154,10 @@ def _find_best_segments_for_od_candidates_raptor(
             total_score = _score_segments_with_transfer_penalty(
                 segments,
                 int(best_end_score) + start_penalty,
+                max_transfers=max_transfers,
             )
+            if total_score >= int(2**62 - 1):
+                continue
             logger.info(
                 "RAPTOR multi-end success start=%s end=%s attempts=%s",
                 start_idx,
@@ -1010,6 +1245,7 @@ def _find_best_segments_for_od_candidates(
     departure_time: int,
     start_penalties: dict[int, int] | None = None,
     end_penalties: dict[int, int] | None = None,
+    max_transfers: int = DEFAULT_MAX_TRANSFERS,
 ):
     if algorithm == "raptor":
         return _find_best_segments_for_od_candidates_raptor(
@@ -1019,6 +1255,7 @@ def _find_best_segments_for_od_candidates(
             departure_time,
             start_penalties,
             end_penalties,
+            max_transfers,
         )
 
     best_segments = []
@@ -1034,6 +1271,7 @@ def _find_best_segments_for_od_candidates(
             int(end_idx),
             departure_time,
             start_penalties,
+            max_transfers,
         )
         if not segments or start_idx is None or start_score is None:
             continue
@@ -1059,8 +1297,15 @@ def _build_option_response(
     end_penalties: dict[int, int] | None = None,
     origin_anchor: dict[str, Any] | None = None,
     destination_anchor: dict[str, Any] | None = None,
+    max_transfers: int = DEFAULT_MAX_TRANSFERS,
 ) -> dict[str, Any]:
     algorithms = _algorithm_sequence(algorithm)
+    station_whitelist, station_backbone_path = _compute_station_backbone(
+        network,
+        start_indices,
+        end_indices,
+        max_transfers,
+    )
 
     segments = []
     best_start = None
@@ -1076,9 +1321,16 @@ def _build_option_response(
             departure_time,
             start_penalties,
             end_penalties,
+            max_transfers,
         )
+        if segments and algorithm == "raptor":
+            if not _segments_follow_station_backbone(network, segments, station_whitelist):
+                segments = []
         if selected_algorithm == "raptor":
             raptor_diagnostics = _merge_raptor_diagnostics(raptor_diagnostics, diagnostics)
+            if raptor_diagnostics is not None and station_backbone_path:
+                raptor_diagnostics["station_backbone_path"] = [int(value) for value in station_backbone_path]
+                raptor_diagnostics["station_backbone_whitelist_size"] = int(len(station_whitelist or []))
 
             if not segments:
                 destination_tiers = _expand_candidates_tiered(
@@ -1096,8 +1348,11 @@ def _build_option_response(
                         departure_time,
                         start_penalties,
                         end_penalties,
+                        max_transfers,
                     )
                     raptor_diagnostics = _merge_raptor_diagnostics(raptor_diagnostics, tier_diagnostics)
+                    if segments and not _segments_follow_station_backbone(network, segments, station_whitelist):
+                        segments = []
                     if segments:
                         logger.info(
                             "RAPTOR adaptive destination expansion hit tier=%s end_candidates=%s",
@@ -1122,8 +1377,11 @@ def _build_option_response(
                         departure_time,
                         start_penalties,
                         end_penalties,
+                        max_transfers,
                     )
                     raptor_diagnostics = _merge_raptor_diagnostics(raptor_diagnostics, tier_diagnostics)
+                    if segments and not _segments_follow_station_backbone(network, segments, station_whitelist):
+                        segments = []
                     if segments:
                         logger.info(
                             "RAPTOR adaptive origin expansion hit tier=%s start_candidates=%s",
@@ -1157,6 +1415,7 @@ def _build_option_response(
         "resolver_algorithm": resolved_algorithm,
         "fallback_used": resolved_algorithm != algorithm,
         "transfers": _count_transfers(segments),
+        "max_transfers": int(max_transfers),
         "duration_seconds": int(segments[-1][2] - departure_time) if segments else None,
         "start_stop_id": network.stop_ids[best_start] if best_start is not None else None,
         "access_walk_seconds": int(start_penalties.get(best_start, 0)) if (best_start is not None and start_penalties) else 0,
@@ -1181,6 +1440,7 @@ def build_multi_departure_response(
     start_penalties: dict[int, int] | None = None,
     end_penalties: dict[int, int] | None = None,
     metadata: dict[str, Any] | None = None,
+    max_transfers: int = DEFAULT_MAX_TRANSFERS,
 ) -> dict[str, Any]:
     if isinstance(end_idx, list):
         end_indices = [int(value) for value in end_idx]
@@ -1209,6 +1469,7 @@ def build_multi_departure_response(
                         end_penalties,
                         origin_anchor,
                         destination_anchor,
+                        max_transfers,
                     ): idx
                     for idx, minutes in enumerate(offset_minutes)
                 }
@@ -1227,6 +1488,7 @@ def build_multi_departure_response(
                     end_penalties,
                     origin_anchor,
                     destination_anchor,
+                    max_transfers,
                 )
     else:
         current_departure = int(departure_time)
@@ -1242,6 +1504,7 @@ def build_multi_departure_response(
             end_penalties,
             origin_anchor,
             destination_anchor,
+            max_transfers,
         )
         options.append(current_option)
 
@@ -1272,6 +1535,7 @@ def build_multi_departure_response(
                     end_penalties,
                     origin_anchor,
                     destination_anchor,
+                    max_transfers,
                 )
                 next_option_evals += 1
                 candidate_signature = _first_transit_trip_signature(candidate)
@@ -1312,6 +1576,7 @@ def build_multi_departure_response(
         "algorithm": algorithm,
         "candidate_start_count": len(start_indices),
         "candidate_end_count": len(end_indices),
+        "max_transfers": int(max_transfers),
         "network_trip_profile": network_trip_profile,
         **(metadata or {}),
         "resolver_algorithm": base.get("resolver_algorithm", algorithm),
@@ -1345,6 +1610,7 @@ class PathRequestHandler(BaseHTTPRequestHandler):
         origin = payload.get("origin")
         destination = payload.get("destination")
         end_stop_id = payload.get("end_stop_id")
+        max_transfers_raw = payload.get("max_transfers")
         departure_raw = payload.get("departure_time")
         algorithm = payload.get("algorithm", "raptor")
         offset_minutes_payload = payload.get("offset_minutes")
@@ -1375,6 +1641,19 @@ class PathRequestHandler(BaseHTTPRequestHandler):
         departure_time = _departure_to_seconds(departure_raw)
         if departure_time is None:
             self._send_json(400, {"error": "invalid_departure_time"})
+            return
+
+        max_transfers = DEFAULT_MAX_TRANSFERS
+        if max_transfers_raw is not None:
+            if isinstance(max_transfers_raw, (int, float)):
+                max_transfers = int(max_transfers_raw)
+            elif isinstance(max_transfers_raw, str) and max_transfers_raw.strip().lstrip("-").isdigit():
+                max_transfers = int(max_transfers_raw.strip())
+            else:
+                self._send_json(400, {"error": "invalid_max_transfers"})
+                return
+        if max_transfers < 0:
+            self._send_json(400, {"error": "invalid_max_transfers"})
             return
 
         if self.network is None:
@@ -1448,6 +1727,7 @@ class PathRequestHandler(BaseHTTPRequestHandler):
             start_penalties=start_penalties,
             end_penalties=end_penalties,
             metadata=metadata,
+            max_transfers=max_transfers,
         )
         logger.info(
             "HTTP /path algorithm=%s starts=%s ends=%s departure=%s options=%s",
