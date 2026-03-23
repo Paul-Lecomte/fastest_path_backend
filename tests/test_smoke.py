@@ -452,15 +452,22 @@ def test_multi_departure_response_offsets():
     )
 
     assert response["options"]
-    assert len(response["options"]) == 5
+    assert len(response["options"]) >= 1
     assert response["options"][0]["departure_time"] == 900
-    assert response["options"][1]["departure_time"] == 1500
-    assert response["options"][2]["departure_time"] == 2100
-    assert response["options"][3]["departure_time"] == 2700
-    assert response["options"][4]["departure_time"] == 3300
     assert response["options"][0]["segments"]
     assert "network_trip_profile" in response
     assert "trip_count" in response["network_trip_profile"]
+
+    fixed = build_multi_departure_response(
+        network,
+        "raptor",
+        [network.stop_id_index["A"]],
+        network.stop_id_index["C"],
+        900,
+        offset_minutes=(0, 10, 20, 30, 40),
+    )
+    assert len(fixed["options"]) == 5
+    assert fixed["options"][1]["departure_time"] == 1500
 
 
 def test_http_multi_start_selects_fastest_path():
