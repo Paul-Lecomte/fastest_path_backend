@@ -26,19 +26,26 @@ from .solver import (
 
 logger = logging.getLogger("pathfinding.http")
 
-DEFAULT_OFFSET_MINUTES = (0, 10, 20, 30, 40)
+DEFAULT_OFFSET_MINUTES: tuple[int, ...] = ()
+DEFAULT_OPTION_COUNT = 3
+DEFAULT_NEXT_OPTION_SEARCH_WINDOW_MINUTES = 90
+DEFAULT_NEXT_OPTION_STEP_SECONDS = 300
+DEFAULT_NEXT_OPTION_MAX_STEP_SECONDS = 1800
+DEFAULT_NEXT_OPTION_MAX_EVALS = 3
+DEFAULT_NEXT_OPTION_MAX_WALL_SECONDS = 8.0
 DEFAULT_START_EXPANSION_HOPS = 2
 DEFAULT_START_EXPANSION_MAX_STOPS = 256
 DEFAULT_ORIGIN_RADIUS_M = 1000.0
 DEFAULT_ORIGIN_MAX_CANDIDATES = 12
-DEFAULT_ORIGIN_SEED_CANDIDATES = 4
-DEFAULT_DESTINATION_SEED_CANDIDATES = 4
+DEFAULT_ORIGIN_SEED_CANDIDATES = 1
+DEFAULT_DESTINATION_SEED_CANDIDATES = 1
 DEFAULT_WALK_SPEED_MPS = 1.4
 UNIX_TIMESTAMP_MIN_SECONDS = 946684800
 DEFAULT_RAPTOR_ROUNDS_MIN = 8
 DEFAULT_RAPTOR_ROUNDS_MAX = 64
 DEFAULT_ADAPTIVE_EXPANSION_MAX_TIERS = 4
-DEFAULT_RAPTOR_TRANSFER_PENALTY_SECONDS = 900
+DEFAULT_RAPTOR_TRANSFER_PENALTY_SECONDS = 1500
+DEFAULT_OPTION_TRANSFER_PENALTY_SECONDS = 900
 
 
 def _snapshot_indices(values: list[int], limit: int = 64) -> list[int]:
@@ -205,6 +212,28 @@ def _count_transfers(segments) -> int:
             transfers += 1
             current_trip = trip_value
     return transfers
+
+
+def _score_segments_with_transfer_penalty(
+    segments,
+    base_score: int,
+    transfer_penalty_seconds: int = DEFAULT_OPTION_TRANSFER_PENALTY_SECONDS,
+) -> int:
+    return int(base_score) + int(_count_transfers(segments)) * int(transfer_penalty_seconds)
+
+
+def _first_transit_trip_signature(option: dict[str, Any]) -> tuple[str, str | None]:
+    segments = option.get("segments")
+    if not isinstance(segments, list) or not segments:
+        return ("NONE", None)
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        trip_id = segment.get("trip_id")
+        if isinstance(trip_id, str) and trip_id and trip_id != "TRANSFER":
+            stop_id = segment.get("stop_id")
+            return (trip_id, stop_id if isinstance(stop_id, str) else None)
+    return ("TRANSFER_ONLY", None)
 
 
 def _summarize_option_trip_profile(network: TransitNetwork, segments) -> dict[str, Any]:
@@ -758,7 +787,10 @@ def _find_best_segments_for_starts(
         if not segments:
             return [], None, None
         penalty = 0 if start_penalties is None else int(start_penalties.get(only_start, 0))
-        score = int(segments[-1][2]) + penalty
+        score = _score_segments_with_transfer_penalty(
+            segments,
+            int(segments[-1][2]) + penalty,
+        )
         return segments, only_start, score
 
     with ThreadPoolExecutor(max_workers=min(len(start_indices), 16)) as pool:
@@ -782,7 +814,10 @@ def _find_best_segments_for_starts(
         if not result:
             continue
         penalty = 0 if start_penalties is None else int(start_penalties.get(start_idx, 0))
-        score = int(result[-1][2]) + penalty
+        score = _score_segments_with_transfer_penalty(
+            result,
+            int(result[-1][2]) + penalty,
+        )
         if best_score is None or score < best_score:
             best_score = score
             best_segments = result
@@ -884,7 +919,10 @@ def _find_best_segments_for_od_candidates_raptor(
                 continue
 
             start_penalty = 0 if start_penalties is None else int(start_penalties.get(int(start_idx), 0))
-            total_score = int(best_end_score) + start_penalty
+            total_score = _score_segments_with_transfer_penalty(
+                segments,
+                int(best_end_score) + start_penalty,
+            )
             logger.info(
                 "RAPTOR multi-end success start=%s end=%s attempts=%s",
                 start_idx,
@@ -1152,13 +1190,34 @@ def build_multi_departure_response(
     origin_anchor = metadata.get("origin") if isinstance(metadata, dict) else None
     destination_anchor = metadata.get("destination") if isinstance(metadata, dict) else None
 
-    options = [None] * len(offset_minutes)
-    use_parallel_offsets = not (algorithm == "raptor" and not numba_enabled())
-    if use_parallel_offsets:
-        with ThreadPoolExecutor(max_workers=min(len(offset_minutes), 8)) as pool:
-            futures = {
-                pool.submit(
-                    _build_option_response,
+    options: list[dict[str, Any]] = []
+
+    if offset_minutes:
+        options = [None] * len(offset_minutes)
+        use_parallel_offsets = not (algorithm == "raptor" and not numba_enabled())
+        if use_parallel_offsets:
+            with ThreadPoolExecutor(max_workers=min(len(offset_minutes), 8)) as pool:
+                futures = {
+                    pool.submit(
+                        _build_option_response,
+                        network,
+                        algorithm,
+                        start_indices,
+                        end_indices,
+                        departure_time + minutes * 60,
+                        start_penalties,
+                        end_penalties,
+                        origin_anchor,
+                        destination_anchor,
+                    ): idx
+                    for idx, minutes in enumerate(offset_minutes)
+                }
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    options[idx] = future.result()
+        else:
+            for idx, minutes in enumerate(offset_minutes):
+                options[idx] = _build_option_response(
                     network,
                     algorithm,
                     start_indices,
@@ -1168,25 +1227,79 @@ def build_multi_departure_response(
                     end_penalties,
                     origin_anchor,
                     destination_anchor,
-                ): idx
-                for idx, minutes in enumerate(offset_minutes)
-            }
-            for future in as_completed(futures):
-                idx = futures[future]
-                options[idx] = future.result()
+                )
     else:
-        for idx, minutes in enumerate(offset_minutes):
-            options[idx] = _build_option_response(
-                network,
-                algorithm,
-                start_indices,
-                end_indices,
-                departure_time + minutes * 60,
-                start_penalties,
-                end_penalties,
-                origin_anchor,
-                destination_anchor,
-            )
+        current_departure = int(departure_time)
+        next_option_started = time.perf_counter()
+        next_option_evals = 0
+        current_option = _build_option_response(
+            network,
+            algorithm,
+            start_indices,
+            end_indices,
+            current_departure,
+            start_penalties,
+            end_penalties,
+            origin_anchor,
+            destination_anchor,
+        )
+        options.append(current_option)
+
+        max_lookahead_seconds = int(DEFAULT_NEXT_OPTION_SEARCH_WINDOW_MINUTES * 60)
+        step_seconds = max(60, int(DEFAULT_NEXT_OPTION_STEP_SECONDS))
+        max_step_seconds = max(step_seconds, int(DEFAULT_NEXT_OPTION_MAX_STEP_SECONDS))
+        while len(options) < int(DEFAULT_OPTION_COUNT):
+            previous_signature = _first_transit_trip_signature(options[-1])
+            previous_departure = int(options[-1].get("departure_time", current_departure))
+            search_departure = previous_departure + step_seconds
+            search_limit = previous_departure + max_lookahead_seconds
+            found_next = False
+            search_step_seconds = step_seconds
+            same_signature_streak = 0
+
+            while search_departure <= search_limit:
+                if next_option_evals >= int(DEFAULT_NEXT_OPTION_MAX_EVALS):
+                    break
+                if (time.perf_counter() - next_option_started) >= float(DEFAULT_NEXT_OPTION_MAX_WALL_SECONDS):
+                    break
+                candidate = _build_option_response(
+                    network,
+                    algorithm,
+                    start_indices,
+                    end_indices,
+                    search_departure,
+                    start_penalties,
+                    end_penalties,
+                    origin_anchor,
+                    destination_anchor,
+                )
+                next_option_evals += 1
+                candidate_signature = _first_transit_trip_signature(candidate)
+                if candidate.get("segments") and candidate_signature != previous_signature:
+                    options.append(candidate)
+                    current_departure = search_departure
+                    found_next = True
+                    break
+                same_signature_streak += 1
+                if same_signature_streak >= 1:
+                    search_step_seconds = min(max_step_seconds, search_step_seconds * 2)
+                search_departure += search_step_seconds
+
+            if not found_next:
+                if next_option_evals >= int(DEFAULT_NEXT_OPTION_MAX_EVALS):
+                    logger.info(
+                        "Dynamic next-option search stopped by evaluation budget evals=%s options=%s",
+                        next_option_evals,
+                        len(options),
+                    )
+                elif (time.perf_counter() - next_option_started) >= float(DEFAULT_NEXT_OPTION_MAX_WALL_SECONDS):
+                    logger.info(
+                        "Dynamic next-option search stopped by wall-time budget elapsed=%.2fs options=%s evals=%s",
+                        (time.perf_counter() - next_option_started),
+                        len(options),
+                        next_option_evals,
+                    )
+                break
 
     base = options[0] if options else {
         "departure_time": int(departure_time),
