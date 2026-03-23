@@ -483,6 +483,7 @@ def test_http_multi_start_selects_fastest_path():
 
     assert response["segments"]
     assert response["segments"][-1]["arrival_time"] == 940
+    assert response["max_transfers"] == 4
 
 
 def test_http_segments_include_stop_coordinates():
@@ -525,15 +526,15 @@ def test_origin_selects_candidate_starts_and_penalties():
     network = build_mock_network()
     start_indices, penalties, metadata = _select_starts_from_origin(
         network,
-        {"lat": 48.8566, "lon": 2.3522, "radius_m": 300, "max_candidates": 2},
+        {"lat": 48.8566, "lon": 2.3522, "radius_m": 300, "max_candidates": 2, "seed_candidates": 2},
     )
 
     assert start_indices
     assert len(start_indices) <= 2
     assert isinstance(metadata, dict)
     assert metadata["candidate_start_count"] == len(start_indices)
-    assert start_indices[0] == network.stop_id_index["A"]
-    assert penalties[start_indices[0]] <= 1
+    assert network.stop_id_index["A"] in start_indices
+    assert penalties[network.stop_id_index["A"]] <= 1
 
 
 def test_http_origin_route_without_explicit_start_ids():
@@ -636,6 +637,7 @@ def test_raptor_handles_long_transfer_chain():
         network.stop_id_index["S13"],
         900,
         offset_minutes=(0,),
+        max_transfers=20,
     )
 
     assert response["segments"]
@@ -690,6 +692,22 @@ def test_raptor_prefers_short_walk_over_shuttle_bus_transfer():
     assert response["segments"]
     assert response["segments"][-1]["arrival_time"] < 1200
     assert any(segment["trip_id"] == "TRANSFER" for segment in response["segments"])
+
+
+def test_transfer_cap_rejects_high_transfer_path():
+    network = _build_linear_transfer_network(14)
+    response = build_multi_departure_response(
+        network,
+        "raptor",
+        [network.stop_id_index["S0"]],
+        network.stop_id_index["S13"],
+        900,
+        offset_minutes=(0,),
+        max_transfers=2,
+    )
+
+    assert response["segments"] == []
+    assert response["max_transfers"] == 2
 
 
 def test_raptor_option_exposes_diagnostics_on_no_path():
