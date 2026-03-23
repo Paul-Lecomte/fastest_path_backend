@@ -117,6 +117,16 @@ class TransitNetwork:
     transfer_offsets: np.ndarray = field(default_factory=lambda: np.zeros(1, dtype=np.int64))
     transfer_neighbors: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int32))
     transfer_weights: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int64))
+    station_keys: List[str] = field(default_factory=list)
+    stop_station_ids: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int32))
+    station_stop_offsets: np.ndarray = field(default_factory=lambda: np.zeros(1, dtype=np.int64))
+    station_stops: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int32))
+    station_lats: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float64))
+    station_lons: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float64))
+    station_adj_offsets: np.ndarray = field(default_factory=lambda: np.zeros(1, dtype=np.int64))
+    station_adj_neighbors: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int32))
+    station_adj_weights: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int64))
+    hub_station_indices: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int32))
 
 
 def _parse_route_type(value) -> int:
@@ -263,6 +273,140 @@ def _station_key(stop_id: str) -> str:
     if separator == -1:
         return text
     return text[:separator]
+
+
+def _build_station_backbone(
+    stop_ids: list[str],
+    stop_times: np.ndarray,
+    trip_offsets: np.ndarray,
+    stop_lats: np.ndarray,
+    stop_lons: np.ndarray,
+) -> tuple[
+    list[str],
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
+    n_stops = len(stop_ids)
+    if n_stops <= 0:
+        return (
+            [],
+            np.zeros(0, dtype=np.int32),
+            np.zeros(1, dtype=np.int64),
+            np.zeros(0, dtype=np.int32),
+            np.zeros(0, dtype=np.float64),
+            np.zeros(0, dtype=np.float64),
+            np.zeros(1, dtype=np.int64),
+            np.zeros(0, dtype=np.int32),
+            np.zeros(0, dtype=np.int64),
+            np.zeros(0, dtype=np.int32),
+        )
+
+    station_index: Dict[str, int] = {}
+    station_keys: list[str] = []
+    station_members: List[List[int]] = []
+    stop_station_ids = np.zeros(n_stops, dtype=np.int32)
+
+    for stop_idx, stop_id in enumerate(stop_ids):
+        key = _station_key(stop_id)
+        if key not in station_index:
+            station_index[key] = len(station_keys)
+            station_keys.append(key)
+            station_members.append([])
+        station_id = station_index[key]
+        stop_station_ids[stop_idx] = station_id
+        station_members[station_id].append(stop_idx)
+
+    station_count = len(station_keys)
+    station_stop_offsets = np.zeros(station_count + 1, dtype=np.int64)
+    station_stops = np.zeros(n_stops, dtype=np.int32)
+    cursor = 0
+    for station_id, members in enumerate(station_members):
+        station_stop_offsets[station_id] = cursor
+        for stop_idx in members:
+            station_stops[cursor] = int(stop_idx)
+            cursor += 1
+    station_stop_offsets[station_count] = cursor
+
+    station_lats = np.full(station_count, np.nan, dtype=np.float64)
+    station_lons = np.full(station_count, np.nan, dtype=np.float64)
+    for station_id, members in enumerate(station_members):
+        member_array = np.array(members, dtype=np.int32)
+        member_lats = stop_lats[member_array]
+        member_lons = stop_lons[member_array]
+        finite_lats = member_lats[np.isfinite(member_lats)]
+        finite_lons = member_lons[np.isfinite(member_lons)]
+        if finite_lats.size > 0:
+            station_lats[station_id] = float(np.mean(finite_lats))
+        if finite_lons.size > 0:
+            station_lons[station_id] = float(np.mean(finite_lons))
+
+    station_edges: List[Dict[int, int]] = [dict() for _ in range(station_count)]
+    n_trips = int(trip_offsets.shape[0] - 1)
+    for trip_id in range(n_trips):
+        trip_start = int(trip_offsets[trip_id])
+        trip_end = int(trip_offsets[trip_id + 1])
+        if trip_end - trip_start <= 1:
+            continue
+
+        prev_station = int(stop_station_ids[int(stop_times[trip_start][0])])
+        prev_time = int(stop_times[trip_start][2])
+        for idx in range(trip_start + 1, trip_end):
+            stop_id = int(stop_times[idx][0])
+            station_id = int(stop_station_ids[stop_id])
+            arrival_time = int(stop_times[idx][2])
+            if station_id != prev_station:
+                travel_time = arrival_time - prev_time
+                if travel_time >= 0:
+                    current = station_edges[prev_station].get(station_id)
+                    if current is None or travel_time < current:
+                        station_edges[prev_station][station_id] = int(travel_time)
+                prev_station = station_id
+                prev_time = arrival_time
+
+    total_station_edges = sum(len(item) for item in station_edges)
+    station_adj_offsets = np.zeros(station_count + 1, dtype=np.int64)
+    station_adj_neighbors = np.zeros(total_station_edges, dtype=np.int32)
+    station_adj_weights = np.zeros(total_station_edges, dtype=np.int64)
+    cursor = 0
+    for station_id in range(station_count):
+        station_adj_offsets[station_id] = cursor
+        for neighbor_station, weight in station_edges[station_id].items():
+            station_adj_neighbors[cursor] = int(neighbor_station)
+            station_adj_weights[cursor] = int(weight)
+            cursor += 1
+    station_adj_offsets[station_count] = cursor
+
+    out_degree = np.array([len(station_edges[idx]) for idx in range(station_count)], dtype=np.int64)
+    in_degree = np.zeros(station_count, dtype=np.int64)
+    for source_station in range(station_count):
+        for target_station in station_edges[source_station].keys():
+            in_degree[int(target_station)] += 1
+    station_degree = out_degree + in_degree
+
+    if station_count <= 512:
+        hub_station_indices = np.arange(station_count, dtype=np.int32)
+    else:
+        degree_order = np.argsort(-station_degree)
+        hub_station_indices = degree_order[:512].astype(np.int32)
+
+    return (
+        station_keys,
+        stop_station_ids,
+        station_stop_offsets,
+        station_stops,
+        station_lats,
+        station_lons,
+        station_adj_offsets,
+        station_adj_neighbors,
+        station_adj_weights,
+        hub_station_indices,
+    )
 
 
 def _build_transfers(
@@ -427,6 +571,47 @@ def _ensure_trip_cost_arrays(network: TransitNetwork) -> TransitNetwork:
     return network
 
 
+def _ensure_station_backbone(network: TransitNetwork) -> TransitNetwork:
+    n_stops = int(network.stops.shape[0])
+    stop_station_ids = getattr(network, "stop_station_ids", None)
+    station_adj_offsets = getattr(network, "station_adj_offsets", None)
+
+    has_station_mapping = isinstance(stop_station_ids, np.ndarray) and stop_station_ids.shape[0] == n_stops
+    has_station_graph = isinstance(station_adj_offsets, np.ndarray) and station_adj_offsets.shape[0] >= 1
+    if has_station_mapping and has_station_graph:
+        return network
+
+    (
+        station_keys,
+        stop_station_ids,
+        station_stop_offsets,
+        station_stops,
+        station_lats,
+        station_lons,
+        station_adj_offsets,
+        station_adj_neighbors,
+        station_adj_weights,
+        hub_station_indices,
+    ) = _build_station_backbone(
+        network.stop_ids,
+        network.stop_times,
+        network.trip_offsets,
+        network.stop_lats,
+        network.stop_lons,
+    )
+    network.station_keys = station_keys
+    network.stop_station_ids = stop_station_ids
+    network.station_stop_offsets = station_stop_offsets
+    network.station_stops = station_stops
+    network.station_lats = station_lats
+    network.station_lons = station_lons
+    network.station_adj_offsets = station_adj_offsets
+    network.station_adj_neighbors = station_adj_neighbors
+    network.station_adj_weights = station_adj_weights
+    network.hub_station_indices = hub_station_indices
+    return network
+
+
 def summarize_trip_profiles(network: TransitNetwork, top_k: int = 8) -> dict[str, object]:
     trip_route_types = getattr(network, "trip_route_types", np.zeros(0, dtype=np.int16))
     trip_cost_factors = getattr(network, "trip_cost_factors", np.zeros(0, dtype=np.int64))
@@ -496,6 +681,7 @@ def load_network_from_cache(cache_path: str, max_age_seconds: int | None = None)
         )
         network = _ensure_transfer_graph(network)
         network = _ensure_trip_cost_arrays(network)
+        network = _ensure_station_backbone(network)
         return network
     except Exception as exc:
         logger.warning("Failed to load network cache path=%s error=%s", path, exc)
@@ -658,7 +844,7 @@ class NetworkLoader:
             stop_lons,
         )
 
-        return TransitNetwork(
+        network = TransitNetwork(
             stops=stops_array,
             stop_times=stop_times_array,
             routes=routes_array,
@@ -688,6 +874,7 @@ class NetworkLoader:
             transfer_neighbors=transfer_neighbors,
             transfer_weights=transfer_weights,
         )
+        return _ensure_station_backbone(network)
 
 
 def _build_adjacency(stop_times: np.ndarray, trip_offsets: np.ndarray, n_stops: int):
