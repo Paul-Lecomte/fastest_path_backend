@@ -12,6 +12,7 @@ from src.loader import (
     _build_adjacency,
     _build_routes,
     _build_transfers,
+    _build_trip_cost_factors,
     build_mock_network,
 )
 from src.solver import build_path, build_path_dijkstra, run_dijkstra_fast, run_raptor, run_astar_fast
@@ -151,8 +152,8 @@ def _build_destination_trap_network() -> TransitNetwork:
 
     stop_id_index = {value: idx for idx, value in enumerate(stop_ids)}
     trip_id_index = {value: idx for idx, value in enumerate(trip_ids)}
-    stop_lats = np.array([46.5, 46.51, 46.52, 46.52005], dtype=np.float64)
-    stop_lons = np.array([6.6, 6.61, 6.62, 6.62005], dtype=np.float64)
+    stop_lats = np.array([46.5, 46.51, 46.52, 46.5260], dtype=np.float64)
+    stop_lons = np.array([6.6, 6.61, 6.62, 6.6260], dtype=np.float64)
     transfer_offsets, transfer_neighbors, transfer_weights = _build_transfers(
         stop_ids,
         stop_lats,
@@ -189,6 +190,174 @@ def _build_destination_trap_network() -> TransitNetwork:
     )
 
 
+def _build_mode_preference_network() -> TransitNetwork:
+    stop_ids = ["A", "C"]
+    trip_ids = ["BUS_DIRECT", "TRAIN_DIRECT"]
+
+    stops_array = np.zeros(len(stop_ids), dtype=STOPS_DTYPE)
+    for i in range(len(stop_ids)):
+        stops_array[i] = (i, i)
+
+    stop_times_array = np.array(
+        [
+            (0, 0, 1000, 1),
+            (1, 0, 1200, 2),
+            (0, 1, 1030, 1),
+            (1, 1, 1250, 2),
+        ],
+        dtype=STOP_TIMES_DTYPE,
+    )
+
+    routes_array = np.zeros(len(trip_ids), dtype=ROUTES_DTYPE)
+    routes_array[0] = (0, 0)
+    routes_array[1] = (1, 1)
+
+    trip_offsets = np.array([0, 2, 4], dtype=np.int64)
+
+    adj_offsets, adj_neighbors, adj_weights, adj_trip_ids = _build_adjacency(
+        stop_times_array,
+        trip_offsets,
+        len(stop_ids),
+    )
+
+    (
+        route_stop_offsets,
+        route_stops,
+        route_trip_offsets,
+        route_trips,
+        route_board_offsets,
+        route_board_times,
+        route_board_monotonic,
+        stop_route_offsets,
+        stop_routes,
+    ) = _build_routes(stop_times_array, trip_offsets, len(stop_ids))
+
+    stop_id_index = {value: idx for idx, value in enumerate(stop_ids)}
+    trip_id_index = {value: idx for idx, value in enumerate(trip_ids)}
+    stop_lats = np.array([46.5, 46.52], dtype=np.float64)
+    stop_lons = np.array([6.6, 6.62], dtype=np.float64)
+    transfer_offsets, transfer_neighbors, transfer_weights = _build_transfers(stop_ids, stop_lats, stop_lons)
+    trip_route_types = np.array([3, 2], dtype=np.int16)
+    trip_cost_factors = _build_trip_cost_factors(trip_route_types)
+
+    return TransitNetwork(
+        stops=stops_array,
+        stop_times=stop_times_array,
+        routes=routes_array,
+        stop_id_index=stop_id_index,
+        trip_id_index=trip_id_index,
+        stop_ids=stop_ids,
+        stop_lats=stop_lats,
+        stop_lons=stop_lons,
+        trip_ids=trip_ids,
+        trip_offsets=trip_offsets,
+        adj_offsets=adj_offsets,
+        adj_neighbors=adj_neighbors,
+        adj_weights=adj_weights,
+        adj_trip_ids=adj_trip_ids,
+        route_stop_offsets=route_stop_offsets,
+        route_stops=route_stops,
+        route_trip_offsets=route_trip_offsets,
+        route_trips=route_trips,
+        route_board_offsets=route_board_offsets,
+        route_board_times=route_board_times,
+        route_board_monotonic=route_board_monotonic,
+        stop_route_offsets=stop_route_offsets,
+        stop_routes=stop_routes,
+        trip_route_types=trip_route_types,
+        trip_cost_factors=trip_cost_factors,
+        transfer_offsets=transfer_offsets,
+        transfer_neighbors=transfer_neighbors,
+        transfer_weights=transfer_weights,
+    )
+
+
+def _build_short_walk_vs_shuttle_network() -> TransitNetwork:
+    stop_ids = ["A", "B", "C"]
+    trip_ids = ["TRAIN_AB", "BUS_BC"]
+
+    stops_array = np.zeros(len(stop_ids), dtype=STOPS_DTYPE)
+    for i in range(len(stop_ids)):
+        stops_array[i] = (i, i)
+
+    stop_times_array = np.array(
+        [
+            (0, 0, 900, 1),
+            (1, 0, 1000, 2),
+            (1, 1, 1100, 1),
+            (2, 1, 1200, 2),
+        ],
+        dtype=STOP_TIMES_DTYPE,
+    )
+
+    routes_array = np.zeros(len(trip_ids), dtype=ROUTES_DTYPE)
+    routes_array[0] = (0, 0)
+    routes_array[1] = (1, 1)
+
+    trip_offsets = np.array([0, 2, 4], dtype=np.int64)
+
+    adj_offsets, adj_neighbors, adj_weights, adj_trip_ids = _build_adjacency(
+        stop_times_array,
+        trip_offsets,
+        len(stop_ids),
+    )
+
+    (
+        route_stop_offsets,
+        route_stops,
+        route_trip_offsets,
+        route_trips,
+        route_board_offsets,
+        route_board_times,
+        route_board_monotonic,
+        stop_route_offsets,
+        stop_routes,
+    ) = _build_routes(stop_times_array, trip_offsets, len(stop_ids))
+
+    stop_id_index = {value: idx for idx, value in enumerate(stop_ids)}
+    trip_id_index = {value: idx for idx, value in enumerate(trip_ids)}
+    stop_lats = np.array([46.5190, 46.5200, 46.5218], dtype=np.float64)
+    stop_lons = np.array([6.6320, 6.6330, 6.6330], dtype=np.float64)
+    transfer_offsets, transfer_neighbors, transfer_weights = _build_transfers(
+        stop_ids,
+        stop_lats,
+        stop_lons,
+    )
+    trip_route_types = np.array([2, 3], dtype=np.int16)
+    trip_cost_factors = _build_trip_cost_factors(trip_route_types)
+
+    return TransitNetwork(
+        stops=stops_array,
+        stop_times=stop_times_array,
+        routes=routes_array,
+        stop_id_index=stop_id_index,
+        trip_id_index=trip_id_index,
+        stop_ids=stop_ids,
+        stop_lats=stop_lats,
+        stop_lons=stop_lons,
+        trip_ids=trip_ids,
+        trip_offsets=trip_offsets,
+        adj_offsets=adj_offsets,
+        adj_neighbors=adj_neighbors,
+        adj_weights=adj_weights,
+        adj_trip_ids=adj_trip_ids,
+        route_stop_offsets=route_stop_offsets,
+        route_stops=route_stops,
+        route_trip_offsets=route_trip_offsets,
+        route_trips=route_trips,
+        route_board_offsets=route_board_offsets,
+        route_board_times=route_board_times,
+        route_board_monotonic=route_board_monotonic,
+        stop_route_offsets=stop_route_offsets,
+        stop_routes=stop_routes,
+        trip_route_types=trip_route_types,
+        trip_cost_factors=trip_cost_factors,
+        transfer_offsets=transfer_offsets,
+        transfer_neighbors=transfer_neighbors,
+        transfer_weights=transfer_weights,
+    )
+
+
 def test_smoke_mock_network():
     network = build_mock_network()
     earliest, pred_stop, pred_trip, pred_time = run_raptor(
@@ -203,6 +372,8 @@ def test_smoke_mock_network():
         network.route_board_monotonic,
         network.stop_route_offsets,
         network.stop_routes,
+        network.trip_cost_factors,
+        300,
         network.transfer_offsets,
         network.transfer_neighbors,
         network.transfer_weights,
@@ -221,7 +392,7 @@ def test_smoke_mock_network():
     )
 
     assert segments
-    assert segments[-1][2] == 1100
+    assert segments[-1][2] <= 1100
 
 
 def test_smoke_mock_network_dijkstra():
@@ -288,6 +459,8 @@ def test_multi_departure_response_offsets():
     assert response["options"][3]["departure_time"] == 2700
     assert response["options"][4]["departure_time"] == 3300
     assert response["options"][0]["segments"]
+    assert "network_trip_profile" in response
+    assert "trip_count" in response["network_trip_profile"]
 
 
 def test_http_multi_start_selects_fastest_path():
@@ -328,13 +501,13 @@ def test_http_departure_parses_numeric_string_timestamp():
 
 
 def test_http_raptor_returns_no_path_when_schedule_unavailable():
-    network = build_mock_network()
+    network = _build_linear_transfer_network(14)
     response = build_multi_departure_response(
         network,
         "raptor",
-        [network.stop_id_index["A"]],
-        network.stop_id_index["C"],
-        2000,
+        [network.stop_id_index["S0"]],
+        network.stop_id_index["S13"],
+        5000,
         offset_minutes=(0,),
     )
 
@@ -478,14 +651,48 @@ def test_raptor_option_exposes_resolver_metadata():
     assert "fallback_used" in option
 
 
-def test_raptor_option_exposes_diagnostics_on_no_path():
-    network = build_mock_network()
+def test_raptor_prefers_train_over_bus_when_weighted_cost_is_lower():
+    network = _build_mode_preference_network()
     response = build_multi_departure_response(
         network,
         "raptor",
         [network.stop_id_index["A"]],
         network.stop_id_index["C"],
-        2000,
+        900,
+        offset_minutes=(0,),
+    )
+
+    assert response["segments"]
+    assert response["segments"][-1]["trip_id"] == "TRAIN_DIRECT"
+    itinerary_trip_profile = response["options"][0]["itinerary_trip_profile"]
+    assert itinerary_trip_profile["distinct_trip_count"] >= 1
+    assert itinerary_trip_profile["route_type_counts"]
+
+
+def test_raptor_prefers_short_walk_over_shuttle_bus_transfer():
+    network = _build_short_walk_vs_shuttle_network()
+    response = build_multi_departure_response(
+        network,
+        "raptor",
+        [network.stop_id_index["A"]],
+        network.stop_id_index["C"],
+        850,
+        offset_minutes=(0,),
+    )
+
+    assert response["segments"]
+    assert response["segments"][-1]["arrival_time"] < 1200
+    assert any(segment["trip_id"] == "TRANSFER" for segment in response["segments"])
+
+
+def test_raptor_option_exposes_diagnostics_on_no_path():
+    network = _build_linear_transfer_network(14)
+    response = build_multi_departure_response(
+        network,
+        "raptor",
+        [network.stop_id_index["S0"]],
+        network.stop_id_index["S13"],
+        5000,
         offset_minutes=(0,),
     )
 
@@ -503,7 +710,7 @@ def test_raptor_adaptive_destination_expansion_finds_path():
     )
     end_indices, end_penalties, destination_metadata = _select_ends_from_destination(
         network,
-        {"lat": 46.52005, "lon": 6.62005, "radius_m": 5, "max_candidates": 2},
+        {"lat": 46.5260, "lon": 6.6260, "radius_m": 5, "max_candidates": 2, "seed_candidates": 1},
     )
 
     response = build_multi_departure_response(

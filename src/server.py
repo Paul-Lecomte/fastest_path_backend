@@ -19,6 +19,7 @@ logger = logging.getLogger("pathfinding.server")
 
 SUPPORTED_ALGORITHMS = {"raptor", "dijkstra", "astar"}
 RAPTOR_ROUND_BUDGETS = (8, 16, 32, 64)
+DEFAULT_RAPTOR_TRANSFER_PENALTY_SECONDS = 900
 
 
 def _algorithm_sequence(primary: str) -> tuple[str, ...]:
@@ -44,6 +45,8 @@ def _compute_segments(network, algorithm: str, start_stop_id: int, end_stop_id: 
                 network.route_board_monotonic,
                 network.stop_route_offsets,
                 network.stop_routes,
+                network.trip_cost_factors,
+                DEFAULT_RAPTOR_TRANSFER_PENALTY_SECONDS,
                 network.transfer_offsets,
                 network.transfer_neighbors,
                 network.transfer_weights,

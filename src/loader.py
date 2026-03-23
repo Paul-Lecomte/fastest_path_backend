@@ -18,6 +18,26 @@ DEFAULT_TRANSFER_WALK_SPEED_MPS = 1.4
 DEFAULT_TRANSFER_MIN_SECONDS = 30
 DEFAULT_TRANSFER_FALLBACK_SECONDS = 120
 DEFAULT_TRANSFER_MAX_DISTANCE_M = 600.0
+DEFAULT_TRANSFER_NEARBY_MAX_DISTANCE_M = 300.0
+DEFAULT_TRANSFER_NEARBY_MAX_NEIGHBORS = 12
+
+DEFAULT_ROUTE_TYPE_UNKNOWN = -1
+DEFAULT_ROUTE_TYPE_COST_FACTORS = {
+    -1: 1450,
+    0: 1100,
+    1: 1100,
+    2: 1000,
+    3: 2000,
+    4: 1200,
+    5: 1300,
+    6: 1200,
+    7: 2000,
+    11: 2000,
+    12: 2000,
+    100: 1000,
+    109: 1100,
+    1000: 1200,
+}
 
 
 def parse_time_to_seconds(value) -> int:
@@ -92,9 +112,132 @@ class TransitNetwork:
     route_board_monotonic: np.ndarray
     stop_route_offsets: np.ndarray
     stop_routes: np.ndarray
+    trip_route_types: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int16))
+    trip_cost_factors: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int64))
     transfer_offsets: np.ndarray = field(default_factory=lambda: np.zeros(1, dtype=np.int64))
     transfer_neighbors: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int32))
     transfer_weights: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int64))
+
+
+def _parse_route_type(value) -> int:
+    if value is None:
+        return DEFAULT_ROUTE_TYPE_UNKNOWN
+    if isinstance(value, (np.integer, int)):
+        return int(value)
+    if isinstance(value, (np.floating, float)):
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if text.lstrip("-").isdigit():
+            return int(text)
+        normalized = text.lower()
+        if normalized in {"rail", "train", "intercity", "interregio", "ic", "ir", "rer", "sbahn", "s-bahn", "subway", "metro"}:
+            return 2
+        if normalized in {"tram", "streetcar", "light_rail", "light-rail"}:
+            return 0
+        if normalized in {"bus", "coach", "autobus"}:
+            return 3
+        if normalized in {"ferry", "boat"}:
+            return 4
+        if normalized in {"cable", "gondola", "funicular", "lift"}:
+            return 6
+        try:
+            return int(float(normalized))
+        except ValueError:
+            return DEFAULT_ROUTE_TYPE_UNKNOWN
+    return DEFAULT_ROUTE_TYPE_UNKNOWN
+
+
+def _route_type_cost_factor(route_type: int) -> int:
+    return int(DEFAULT_ROUTE_TYPE_COST_FACTORS.get(int(route_type), DEFAULT_ROUTE_TYPE_COST_FACTORS[DEFAULT_ROUTE_TYPE_UNKNOWN]))
+
+
+def _trip_factor_from_speed_mps(avg_speed_mps: float) -> int:
+    if avg_speed_mps >= 14.0:
+        return 1000
+    if avg_speed_mps >= 10.0:
+        return 1150
+    if avg_speed_mps >= 7.0:
+        return 1450
+    return 1900
+
+
+def _estimate_trip_average_speed_mps(
+    trip_id: int,
+    stop_times: np.ndarray,
+    trip_offsets: np.ndarray,
+    stop_lats: np.ndarray,
+    stop_lons: np.ndarray,
+) -> float | None:
+    start = int(trip_offsets[trip_id])
+    end = int(trip_offsets[trip_id + 1])
+    if end - start <= 1:
+        return None
+
+    total_distance_m = 0.0
+    total_seconds = 0.0
+    for idx in range(start + 1, end):
+        prev_stop_id = int(stop_times[idx - 1][0])
+        stop_id = int(stop_times[idx][0])
+        prev_time = int(stop_times[idx - 1][2])
+        arrival_time = int(stop_times[idx][2])
+        delta_t = arrival_time - prev_time
+        if delta_t <= 0:
+            continue
+
+        if prev_stop_id >= stop_lats.shape[0] or stop_id >= stop_lats.shape[0]:
+            continue
+        lat1 = float(stop_lats[prev_stop_id])
+        lon1 = float(stop_lons[prev_stop_id])
+        lat2 = float(stop_lats[stop_id])
+        lon2 = float(stop_lons[stop_id])
+        if not (np.isfinite(lat1) and np.isfinite(lon1) and np.isfinite(lat2) and np.isfinite(lon2)):
+            continue
+
+        distance_m = _haversine_m(lat1, lon1, lat2, lon2)
+        if distance_m <= 0:
+            continue
+        total_distance_m += float(distance_m)
+        total_seconds += float(delta_t)
+
+    if total_seconds <= 0:
+        return None
+    return total_distance_m / total_seconds
+
+
+def _build_trip_cost_factors(
+    trip_route_types: np.ndarray,
+    stop_times: np.ndarray | None = None,
+    trip_offsets: np.ndarray | None = None,
+    stop_lats: np.ndarray | None = None,
+    stop_lons: np.ndarray | None = None,
+) -> np.ndarray:
+    factors = np.empty(trip_route_types.shape[0], dtype=np.int64)
+    for idx in range(trip_route_types.shape[0]):
+        route_type = int(trip_route_types[idx])
+        if route_type != DEFAULT_ROUTE_TYPE_UNKNOWN:
+            factors[idx] = _route_type_cost_factor(route_type)
+            continue
+
+        speed_mps = None
+        if (
+            stop_times is not None
+            and trip_offsets is not None
+            and stop_lats is not None
+            and stop_lons is not None
+        ):
+            speed_mps = _estimate_trip_average_speed_mps(
+                idx,
+                stop_times,
+                trip_offsets,
+                stop_lats,
+                stop_lons,
+            )
+        if speed_mps is None:
+            factors[idx] = 1500
+        else:
+            factors[idx] = _trip_factor_from_speed_mps(float(speed_mps))
+    return factors
 
 
 def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -130,6 +273,8 @@ def _build_transfers(
     min_seconds: int = DEFAULT_TRANSFER_MIN_SECONDS,
     fallback_seconds: int = DEFAULT_TRANSFER_FALLBACK_SECONDS,
     max_distance_m: float = DEFAULT_TRANSFER_MAX_DISTANCE_M,
+    nearby_max_distance_m: float = DEFAULT_TRANSFER_NEARBY_MAX_DISTANCE_M,
+    nearby_max_neighbors: int = DEFAULT_TRANSFER_NEARBY_MAX_NEIGHBORS,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     n_stops = len(stop_ids)
     if n_stops <= 0:
@@ -175,6 +320,53 @@ def _build_transfers(
                 if current is None or travel_seconds < current:
                     edges[source][target] = int(travel_seconds)
 
+    nearby_distance_limit = float(nearby_max_distance_m) if nearby_max_distance_m > 0 else 0.0
+    nearby_neighbor_cap = int(nearby_max_neighbors) if nearby_max_neighbors > 0 else 0
+    if nearby_distance_limit > 0 and nearby_neighbor_cap > 0:
+        lat_step_deg = nearby_distance_limit / 111320.0
+        lon_step_deg = nearby_distance_limit / 111320.0
+        if lat_step_deg > 0 and lon_step_deg > 0:
+            buckets: Dict[Tuple[int, int], List[int]] = {}
+            valid_stops: List[int] = []
+            for stop_idx in range(n_stops):
+                lat = float(stop_lats[stop_idx]) if stop_idx < stop_lats.shape[0] else np.nan
+                lon = float(stop_lons[stop_idx]) if stop_idx < stop_lons.shape[0] else np.nan
+                if not (np.isfinite(lat) and np.isfinite(lon)):
+                    continue
+                row = int(np.floor(lat / lat_step_deg))
+                col = int(np.floor(lon / lon_step_deg))
+                buckets.setdefault((row, col), []).append(stop_idx)
+                valid_stops.append(stop_idx)
+
+            for source in valid_stops:
+                src_lat = float(stop_lats[source])
+                src_lon = float(stop_lons[source])
+                src_row = int(np.floor(src_lat / lat_step_deg))
+                src_col = int(np.floor(src_lon / lon_step_deg))
+
+                candidates: List[Tuple[float, int]] = []
+                for d_row in (-1, 0, 1):
+                    for d_col in (-1, 0, 1):
+                        for target in buckets.get((src_row + d_row, src_col + d_col), []):
+                            if target == source:
+                                continue
+                            tgt_lat = float(stop_lats[target])
+                            tgt_lon = float(stop_lons[target])
+                            distance_m = _haversine_m(src_lat, src_lon, tgt_lat, tgt_lon)
+                            if distance_m <= 0 or distance_m > nearby_distance_limit:
+                                continue
+                            candidates.append((distance_m, target))
+
+                if not candidates:
+                    continue
+
+                candidates.sort(key=lambda item: item[0])
+                for distance_m, target in candidates[:nearby_neighbor_cap]:
+                    travel_seconds = max(min_walk, int(distance_m / speed))
+                    current = edges[source].get(target)
+                    if current is None or travel_seconds < current:
+                        edges[source][target] = int(travel_seconds)
+
     total_edges = sum(len(neighbors) for neighbors in edges)
     transfer_offsets = np.zeros(n_stops + 1, dtype=np.int64)
     transfer_neighbors = np.zeros(total_edges, dtype=np.int32)
@@ -213,6 +405,66 @@ def _ensure_transfer_graph(network: TransitNetwork) -> TransitNetwork:
     return network
 
 
+def _ensure_trip_cost_arrays(network: TransitNetwork) -> TransitNetwork:
+    n_trips = int(network.trip_offsets.shape[0] - 1)
+    route_types = getattr(network, "trip_route_types", None)
+    factors = getattr(network, "trip_cost_factors", None)
+
+    if not isinstance(route_types, np.ndarray) or route_types.shape[0] != n_trips:
+        route_types = np.full(n_trips, DEFAULT_ROUTE_TYPE_UNKNOWN, dtype=np.int16)
+        network.trip_route_types = route_types
+
+    if not isinstance(factors, np.ndarray) or factors.shape[0] != n_trips:
+        factors = _build_trip_cost_factors(
+            network.trip_route_types,
+            network.stop_times,
+            network.trip_offsets,
+            network.stop_lats,
+            network.stop_lons,
+        )
+        network.trip_cost_factors = factors
+
+    return network
+
+
+def summarize_trip_profiles(network: TransitNetwork, top_k: int = 8) -> dict[str, object]:
+    trip_route_types = getattr(network, "trip_route_types", np.zeros(0, dtype=np.int16))
+    trip_cost_factors = getattr(network, "trip_cost_factors", np.zeros(0, dtype=np.int64))
+
+    trip_count = int(trip_cost_factors.shape[0])
+    if trip_count <= 0:
+        return {
+            "trip_count": 0,
+            "route_type_unknown_share": 0.0,
+            "route_type_counts_top": [],
+            "factor_counts_top": [],
+        }
+
+    unknown_mask = trip_route_types == int(DEFAULT_ROUTE_TYPE_UNKNOWN)
+    unknown_share = float(np.count_nonzero(unknown_mask) / max(1, trip_count))
+
+    route_values, route_counts = np.unique(trip_route_types.astype(np.int64), return_counts=True)
+    route_pairs = sorted(
+        [(int(route_type), int(count)) for route_type, count in zip(route_values.tolist(), route_counts.tolist())],
+        key=lambda item: item[1],
+        reverse=True,
+    )
+
+    factor_values, factor_counts = np.unique(trip_cost_factors.astype(np.int64), return_counts=True)
+    factor_pairs = sorted(
+        [(int(factor), int(count)) for factor, count in zip(factor_values.tolist(), factor_counts.tolist())],
+        key=lambda item: item[1],
+        reverse=True,
+    )
+
+    return {
+        "trip_count": trip_count,
+        "route_type_unknown_share": round(unknown_share, 6),
+        "route_type_counts_top": route_pairs[: max(1, int(top_k))],
+        "factor_counts_top": factor_pairs[: max(1, int(top_k))],
+    }
+
+
 def load_network_from_cache(cache_path: str, max_age_seconds: int | None = None) -> TransitNetwork | None:
     path = Path(cache_path)
     if not path.exists():
@@ -242,7 +494,9 @@ def load_network_from_cache(cache_path: str, max_age_seconds: int | None = None)
             network.stop_times.shape[0],
             network.routes.shape[0],
         )
-        return _ensure_transfer_graph(network)
+        network = _ensure_transfer_graph(network)
+        network = _ensure_trip_cost_arrays(network)
+        return network
     except Exception as exc:
         logger.warning("Failed to load network cache path=%s error=%s", path, exc)
         return None
@@ -273,8 +527,9 @@ class NetworkLoader:
             "RETURN s.stop_id AS stop_id, t.trip_id AS trip_id, "
             "coalesce(st.arrival_time, st.departure_time) AS arrival_time, "
             "st.stop_sequence AS stop_sequence, "
-            "coalesce(s.stop_lat, s.latitude, s.lat) AS stop_lat, "
-            "coalesce(s.stop_lon, s.longitude, s.lon) AS stop_lon"
+            "s.lat AS stop_lat, "
+            "s.lon AS stop_lon, "
+            "-1 AS route_type"
         )
 
         stop_ids: List[str] = []
@@ -282,6 +537,7 @@ class NetworkLoader:
         stop_id_index: Dict[str, int] = {}
         trip_id_index: Dict[str, int] = {}
         stop_coords: Dict[int, Tuple[float, float]] = {}
+        trip_route_type_by_index: Dict[int, int] = {}
         rows: List[Tuple[int, int, int, int]] = []
 
         with self.driver.session() as session:
@@ -293,6 +549,7 @@ class NetworkLoader:
                 stop_sequence = record["stop_sequence"]
                 stop_lat = record["stop_lat"]
                 stop_lon = record["stop_lon"]
+                route_type = _parse_route_type(record.get("route_type"))
                 if arrival_time is None or stop_sequence is None:
                     continue
                 try:
@@ -315,6 +572,11 @@ class NetworkLoader:
                 if trip_id not in trip_id_index:
                     trip_id_index[trip_id] = len(trip_ids)
                     trip_ids.append(trip_id)
+
+                trip_index = trip_id_index[trip_id]
+                existing_route_type = trip_route_type_by_index.get(trip_index)
+                if existing_route_type is None or existing_route_type == DEFAULT_ROUTE_TYPE_UNKNOWN:
+                    trip_route_type_by_index[trip_index] = route_type
 
                 stop_index = stop_id_index[stop_id]
                 if stop_index not in stop_coords and stop_lat is not None and stop_lon is not None:
@@ -362,6 +624,18 @@ class NetworkLoader:
         for idx in range(current_trip + 1, len(trip_offsets)):
             trip_offsets[idx] = len(rows)
 
+        trip_route_types = np.full(len(trip_ids), DEFAULT_ROUTE_TYPE_UNKNOWN, dtype=np.int16)
+        for trip_index, route_type in trip_route_type_by_index.items():
+            if 0 <= int(trip_index) < trip_route_types.shape[0]:
+                trip_route_types[int(trip_index)] = int(route_type)
+        trip_cost_factors = _build_trip_cost_factors(
+            trip_route_types,
+            stop_times_array,
+            trip_offsets,
+            stop_lats,
+            stop_lons,
+        )
+
         adj_offsets, adj_neighbors, adj_weights, adj_trip_ids = _build_adjacency(
             stop_times_array, trip_offsets, len(stop_ids)
         )
@@ -408,6 +682,8 @@ class NetworkLoader:
             route_board_monotonic=route_board_monotonic,
             stop_route_offsets=stop_route_offsets,
             stop_routes=stop_routes,
+            trip_route_types=trip_route_types,
+            trip_cost_factors=trip_cost_factors,
             transfer_offsets=transfer_offsets,
             transfer_neighbors=transfer_neighbors,
             transfer_weights=transfer_weights,
@@ -590,6 +866,14 @@ def build_mock_network() -> TransitNetwork:
     stop_lons = np.array([2.3522, 2.3530, 2.3540], dtype=np.float64)
     trip_id_index = {"T1": 0, "T2": 1}
     trip_offsets = np.array([0, 2, 4], dtype=np.int64)
+    trip_route_types = np.array([3, 2], dtype=np.int16)
+    trip_cost_factors = _build_trip_cost_factors(
+        trip_route_types,
+        stop_times_array,
+        trip_offsets,
+        stop_lats,
+        stop_lons,
+    )
 
     adj_offsets, adj_neighbors, adj_weights, adj_trip_ids = _build_adjacency(
         stop_times_array, trip_offsets, len(stop_ids)
@@ -637,6 +921,8 @@ def build_mock_network() -> TransitNetwork:
         route_board_monotonic=route_board_monotonic,
         stop_route_offsets=stop_route_offsets,
         stop_routes=stop_routes,
+        trip_route_types=trip_route_types,
+        trip_cost_factors=trip_cost_factors,
         transfer_offsets=transfer_offsets,
         transfer_neighbors=transfer_neighbors,
         transfer_weights=transfer_weights,

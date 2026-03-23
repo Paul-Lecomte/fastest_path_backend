@@ -92,6 +92,8 @@ def main() -> None:
             network.route_board_monotonic,
             network.stop_route_offsets,
             network.stop_routes,
+            network.trip_cost_factors,
+            900,
             network.transfer_offsets,
             network.transfer_neighbors,
             network.transfer_weights,

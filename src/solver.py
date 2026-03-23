@@ -48,6 +48,8 @@ def run_raptor_with_stats(
     route_board_monotonic,
     stop_route_offsets,
     stop_routes,
+    trip_cost_factors,
+    transfer_penalty_seconds: int,
     transfer_offsets,
     transfer_neighbors,
     transfer_weights,
@@ -60,7 +62,12 @@ def run_raptor_with_stats(
     n_routes = route_stop_offsets.shape[0] - 1
 
     inf = np.int64(2**62)
+    cost_scale = np.int64(1000)
+    default_trip_factor = np.int64(1000)
+    transfer_penalty_cost = np.int64(max(0, int(transfer_penalty_seconds))) * cost_scale
+    transfer_board_buffer_seconds = np.int64(min(10, max(0, int(transfer_penalty_seconds)) // 60))
     earliest = np.full(n_stops, inf, dtype=np.int64)
+    best_cost = np.full(n_stops, inf, dtype=np.int64)
     pred_stop = np.full(n_stops, -1, dtype=np.int64)
     pred_trip = np.full(n_stops, -1, dtype=np.int64)
     pred_time = np.full(n_stops, -1, dtype=np.int64)
@@ -74,6 +81,7 @@ def run_raptor_with_stats(
     route_min_marked_time = np.full(n_routes, inf, dtype=np.int64)
 
     earliest[start_stop_id] = departure_time
+    best_cost[start_stop_id] = np.int64(departure_time) * cost_scale
     marked[start_stop_id] = 1
     marked_list[0] = np.int64(start_stop_id)
     marked_count = 1
@@ -97,10 +105,13 @@ def run_raptor_with_stats(
                 to_stop = transfer_neighbors[transfer_idx]
                 transfer_time = transfer_weights[transfer_idx]
                 arrival_via_transfer = base_time + transfer_time
-                if best_target != inf and arrival_via_transfer >= best_target:
-                    continue
-                if arrival_via_transfer < earliest[to_stop]:
+                transfer_cost = best_cost[from_stop] + np.int64(transfer_time) * cost_scale
+                should_update = transfer_cost < best_cost[to_stop] or (
+                    transfer_cost == best_cost[to_stop] and arrival_via_transfer < earliest[to_stop]
+                )
+                if should_update:
                     earliest[to_stop] = arrival_via_transfer
+                    best_cost[to_stop] = transfer_cost
                     pred_stop[to_stop] = from_stop
                     pred_trip[to_stop] = -2
                     pred_time[to_stop] = arrival_via_transfer
@@ -132,10 +143,6 @@ def run_raptor_with_stats(
             route_id = route_marked_list[i]
             route_marked[route_id] = 0
 
-            if best_target != inf and route_min_marked_time[route_id] >= best_target:
-                route_min_marked_time[route_id] = inf
-                continue
-
             route_min_marked_time[route_id] = inf
 
             r_start = route_stop_offsets[route_id]
@@ -146,44 +153,100 @@ def run_raptor_with_stats(
                 continue
 
             current_trip_idx = -1
+            current_board_time = inf
+            current_board_cost = inf
             for s_idx in range(r_end - r_start):
                 stop_id = route_stops[r_start + s_idx]
 
                 if marked[stop_id] != 0:
-                    if best_target != inf and earliest[stop_id] >= best_target:
-                        pass
-                    else:
-                        board_offset = route_board_offsets[r_start + s_idx]
-                        board_end = route_board_offsets[r_start + s_idx + 1]
-                        candidate_trip_idx = -1
-                        candidate_arrival = inf
-                        if route_board_monotonic[r_start + s_idx] != 0:
-                            candidate = _lower_bound_int64(
-                                route_board_times,
-                                board_offset,
-                                board_end,
-                                earliest[stop_id],
-                            )
-                            if candidate < board_end:
-                                candidate_trip_idx = t_start + (candidate - board_offset)
-                                candidate_arrival = route_board_times[candidate]
-                        else:
-                            candidate = board_offset
-                            while candidate < board_end:
-                                value = route_board_times[candidate]
-                                if value >= earliest[stop_id] and value < candidate_arrival:
-                                    candidate_arrival = value
-                                    candidate_trip_idx = t_start + (candidate - board_offset)
-                                candidate += 1
+                    board_ready_time = earliest[stop_id]
+                    if _round > 0:
+                        board_ready_time += transfer_board_buffer_seconds
+                    board_offset = route_board_offsets[r_start + s_idx]
+                    board_end = route_board_offsets[r_start + s_idx + 1]
+                    candidate_trip_idx = -1
+                    candidate_arrival = inf
+                    candidate_board_cost = inf
+                    search_cursor = board_offset
+                    if route_board_monotonic[r_start + s_idx] != 0:
+                        search_cursor = _lower_bound_int64(
+                            route_board_times,
+                            board_offset,
+                            board_end,
+                            board_ready_time,
+                        )
 
-                        if candidate_trip_idx != -1:
-                            if current_trip_idx == -1:
+                    candidate_scan_limit = 6
+                    scanned = 0
+                    while search_cursor < board_end and (route_board_monotonic[r_start + s_idx] == 0 or scanned < candidate_scan_limit):
+                        value = route_board_times[search_cursor]
+                        if value >= board_ready_time:
+                            trip_idx = t_start + (search_cursor - board_offset)
+                            trip_id_for_candidate = route_trips[trip_idx]
+                            trip_factor = default_trip_factor
+                            if trip_id_for_candidate >= 0 and trip_id_for_candidate < trip_cost_factors.shape[0]:
+                                trip_factor = trip_cost_factors[trip_id_for_candidate]
+                            wait_time = value - board_ready_time
+                            board_cost = best_cost[stop_id] + np.int64(wait_time) * cost_scale
+                            if _round > 0:
+                                board_cost += transfer_penalty_cost
+
+                            downstream_idx = s_idx + 1
+                            if downstream_idx >= (r_end - r_start):
+                                downstream_idx = s_idx
+                            downstream_arrival = stop_times[trip_offsets[trip_id_for_candidate] + downstream_idx][2]
+                            in_vehicle_preview = downstream_arrival - value
+                            if in_vehicle_preview < 0:
+                                in_vehicle_preview = 0
+                            candidate_score = board_cost + np.int64(in_vehicle_preview) * np.int64(trip_factor)
+
+                            best_candidate_score = inf
+                            if candidate_trip_idx != -1:
+                                chosen_trip_id = route_trips[candidate_trip_idx]
+                                chosen_factor = default_trip_factor
+                                if chosen_trip_id >= 0 and chosen_trip_id < trip_cost_factors.shape[0]:
+                                    chosen_factor = trip_cost_factors[chosen_trip_id]
+                                chosen_downstream = stop_times[trip_offsets[chosen_trip_id] + downstream_idx][2]
+                                chosen_preview = chosen_downstream - candidate_arrival
+                                if chosen_preview < 0:
+                                    chosen_preview = 0
+                                best_candidate_score = candidate_board_cost + np.int64(chosen_preview) * np.int64(chosen_factor)
+
+                            if candidate_trip_idx == -1 or candidate_score < best_candidate_score:
+                                candidate_trip_idx = trip_idx
+                                candidate_arrival = value
+                                candidate_board_cost = board_cost
+
+                        search_cursor += 1
+                        scanned += 1
+
+                    if candidate_trip_idx != -1:
+                        if current_trip_idx == -1:
+                            current_trip_idx = candidate_trip_idx
+                            current_board_time = candidate_arrival
+                            current_board_cost = candidate_board_cost
+                        else:
+                            current_trip_id = route_trips[current_trip_idx]
+                            current_trip_factor = default_trip_factor
+                            if current_trip_id >= 0 and current_trip_id < trip_cost_factors.shape[0]:
+                                current_trip_factor = trip_cost_factors[current_trip_id]
+                            current_arrival = stop_times[trip_offsets[current_trip_id] + s_idx][2]
+                            current_in_vehicle = current_arrival - current_board_time
+                            if current_in_vehicle < 0:
+                                current_in_vehicle = 0
+                            current_score = current_board_cost + np.int64(current_in_vehicle) * np.int64(current_trip_factor)
+
+                            candidate_trip_id = route_trips[candidate_trip_idx]
+                            candidate_trip_factor = default_trip_factor
+                            if candidate_trip_id >= 0 and candidate_trip_id < trip_cost_factors.shape[0]:
+                                candidate_trip_factor = trip_cost_factors[candidate_trip_id]
+                            candidate_in_vehicle = 0
+                            candidate_score = candidate_board_cost + np.int64(candidate_in_vehicle) * np.int64(candidate_trip_factor)
+
+                            if candidate_score < current_score:
                                 current_trip_idx = candidate_trip_idx
-                            else:
-                                current_trip_id = route_trips[current_trip_idx]
-                                current_arrival = stop_times[trip_offsets[current_trip_id] + s_idx][2]
-                                if candidate_arrival < current_arrival:
-                                    current_trip_idx = candidate_trip_idx
+                                current_board_time = candidate_arrival
+                                current_board_cost = candidate_board_cost
 
                 if current_trip_idx == -1:
                     continue
@@ -192,11 +255,21 @@ def run_raptor_with_stats(
                 st_idx = trip_offsets[trip_id] + s_idx
                 arrival_time = stop_times[st_idx][2]
 
-                if best_target != inf and arrival_time >= best_target:
-                    break
+                trip_factor = default_trip_factor
+                if trip_id >= 0 and trip_id < trip_cost_factors.shape[0]:
+                    trip_factor = trip_cost_factors[trip_id]
+                in_vehicle_time = arrival_time - current_board_time
+                if in_vehicle_time < 0:
+                    in_vehicle_time = 0
+                arrival_cost = current_board_cost + np.int64(in_vehicle_time) * np.int64(trip_factor)
 
-                if arrival_time < earliest[stop_id]:
+                should_update = arrival_cost < best_cost[stop_id] or (
+                    arrival_cost == best_cost[stop_id] and arrival_time < earliest[stop_id]
+                )
+
+                if should_update:
                     earliest[stop_id] = arrival_time
+                    best_cost[stop_id] = arrival_cost
                     pred_stop[stop_id] = route_stops[r_start + s_idx - 1] if s_idx > 0 else stop_id
                     pred_trip[stop_id] = trip_id
                     pred_time[stop_id] = arrival_time
@@ -219,10 +292,13 @@ def run_raptor_with_stats(
                 to_stop = transfer_neighbors[transfer_idx]
                 transfer_time = transfer_weights[transfer_idx]
                 arrival_via_transfer = base_time + transfer_time
-                if best_target != inf and arrival_via_transfer >= best_target:
-                    continue
-                if arrival_via_transfer < earliest[to_stop]:
+                transfer_cost = best_cost[from_stop] + np.int64(transfer_time) * cost_scale
+                should_update = transfer_cost < best_cost[to_stop] or (
+                    transfer_cost == best_cost[to_stop] and arrival_via_transfer < earliest[to_stop]
+                )
+                if should_update:
                     earliest[to_stop] = arrival_via_transfer
+                    best_cost[to_stop] = transfer_cost
                     pred_stop[to_stop] = from_stop
                     pred_trip[to_stop] = -2
                     pred_time[to_stop] = arrival_via_transfer
@@ -267,6 +343,8 @@ def run_raptor(
     route_board_monotonic,
     stop_route_offsets,
     stop_routes,
+    trip_cost_factors,
+    transfer_penalty_seconds: int,
     transfer_offsets,
     transfer_neighbors,
     transfer_weights,
@@ -287,6 +365,8 @@ def run_raptor(
         route_board_monotonic,
         stop_route_offsets,
         stop_routes,
+        trip_cost_factors,
+        transfer_penalty_seconds,
         transfer_offsets,
         transfer_neighbors,
         transfer_weights,

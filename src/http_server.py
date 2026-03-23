@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 
 from .config import setup_logging
-from .loader import NetworkLoader, build_mock_network, TransitNetwork
+from .loader import NetworkLoader, build_mock_network, TransitNetwork, summarize_trip_profiles
 from .solver import (
     build_path,
     build_path_dijkstra,
@@ -31,11 +31,14 @@ DEFAULT_START_EXPANSION_HOPS = 2
 DEFAULT_START_EXPANSION_MAX_STOPS = 256
 DEFAULT_ORIGIN_RADIUS_M = 1000.0
 DEFAULT_ORIGIN_MAX_CANDIDATES = 12
+DEFAULT_ORIGIN_SEED_CANDIDATES = 4
+DEFAULT_DESTINATION_SEED_CANDIDATES = 4
 DEFAULT_WALK_SPEED_MPS = 1.4
 UNIX_TIMESTAMP_MIN_SECONDS = 946684800
 DEFAULT_RAPTOR_ROUNDS_MIN = 8
 DEFAULT_RAPTOR_ROUNDS_MAX = 64
 DEFAULT_ADAPTIVE_EXPANSION_MAX_TIERS = 4
+DEFAULT_RAPTOR_TRANSFER_PENALTY_SECONDS = 900
 
 
 def _snapshot_indices(values: list[int], limit: int = 64) -> list[int]:
@@ -204,6 +207,68 @@ def _count_transfers(segments) -> int:
     return transfers
 
 
+def _summarize_option_trip_profile(network: TransitNetwork, segments) -> dict[str, Any]:
+    if not segments:
+        return {
+            "trip_segment_count": 0,
+            "distinct_trip_count": 0,
+            "factor_counts": [],
+            "route_type_counts": [],
+            "unknown_route_type_share": 0.0,
+        }
+
+    distinct_trips = []
+    seen = set()
+    for trip_id, _, _ in segments:
+        trip_idx = int(trip_id)
+        if trip_idx < 0 or trip_idx in seen:
+            continue
+        seen.add(trip_idx)
+        distinct_trips.append(trip_idx)
+
+    if not distinct_trips:
+        return {
+            "trip_segment_count": 0,
+            "distinct_trip_count": 0,
+            "factor_counts": [],
+            "route_type_counts": [],
+            "unknown_route_type_share": 0.0,
+        }
+
+    factor_counts: dict[int, int] = {}
+    route_type_counts: dict[int, int] = {}
+    unknown_count = 0
+
+    trip_cost_factors = network.trip_cost_factors
+    trip_route_types = network.trip_route_types
+    for trip_idx in distinct_trips:
+        factor = int(trip_cost_factors[trip_idx]) if trip_idx < trip_cost_factors.shape[0] else 1500
+        route_type = int(trip_route_types[trip_idx]) if trip_idx < trip_route_types.shape[0] else -1
+        factor_counts[factor] = int(factor_counts.get(factor, 0) + 1)
+        route_type_counts[route_type] = int(route_type_counts.get(route_type, 0) + 1)
+        if route_type == -1:
+            unknown_count += 1
+
+    sorted_factor_counts = sorted(
+        [(int(factor), int(count)) for factor, count in factor_counts.items()],
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    sorted_route_type_counts = sorted(
+        [(int(route_type), int(count)) for route_type, count in route_type_counts.items()],
+        key=lambda item: item[1],
+        reverse=True,
+    )
+
+    return {
+        "trip_segment_count": int(sum(1 for trip_id, _, _ in segments if int(trip_id) >= 0)),
+        "distinct_trip_count": int(len(distinct_trips)),
+        "factor_counts": sorted_factor_counts,
+        "route_type_counts": sorted_route_type_counts,
+        "unknown_route_type_share": round(float(unknown_count / max(1, len(distinct_trips))), 6),
+    }
+
+
 def _departure_to_seconds(value: Any) -> int | None:
     def _from_unix_timestamp(timestamp_value: int) -> int:
         utc = datetime.fromtimestamp(timestamp_value, tz=timezone.utc)
@@ -320,17 +385,21 @@ def _select_starts_from_origin(network: TransitNetwork, origin: Any):
 
     within_radius = sorted_distances <= radius_m
     if np.any(within_radius):
-        selected_indices = sorted_indices[within_radius][:max_candidates]
-        selected_distances = sorted_distances[within_radius][:max_candidates]
+        selected_indices_full = sorted_indices[within_radius][:max_candidates]
+        selected_distances_full = sorted_distances[within_radius][:max_candidates]
     else:
         fallback_count = min(max_candidates, sorted_indices.size)
-        selected_indices = sorted_indices[:fallback_count]
-        selected_distances = sorted_distances[:fallback_count]
+        selected_indices_full = sorted_indices[:fallback_count]
+        selected_distances_full = sorted_distances[:fallback_count]
+
+    seed_candidates = _to_int(origin.get("seed_candidates"), min(DEFAULT_ORIGIN_SEED_CANDIDATES, max_candidates))
+    seed_candidates = max(1, min(seed_candidates, int(selected_indices_full.size)))
+    selected_indices = selected_indices_full[:seed_candidates]
 
     start_indices = [int(value) for value in selected_indices.tolist()]
     start_penalties = {
         int(stop_idx): int(distance_m / walk_speed_mps)
-        for stop_idx, distance_m in zip(selected_indices, selected_distances)
+        for stop_idx, distance_m in zip(selected_indices_full, selected_distances_full)
     }
 
     metadata = {
@@ -338,9 +407,11 @@ def _select_starts_from_origin(network: TransitNetwork, origin: Any):
             "lat": float(lat),
             "lon": float(lon),
             "radius_m": float(radius_m),
+            "seed_candidates": int(seed_candidates),
             "max_candidates": int(max_candidates),
         },
         "candidate_start_count": len(start_indices),
+        "candidate_start_count_max": int(selected_indices_full.size),
     }
     return start_indices, start_penalties, metadata
 
@@ -383,17 +454,21 @@ def _select_ends_from_destination(network: TransitNetwork, destination: Any):
 
     within_radius = sorted_distances <= radius_m
     if np.any(within_radius):
-        selected_indices = sorted_indices[within_radius][:max_candidates]
-        selected_distances = sorted_distances[within_radius][:max_candidates]
+        selected_indices_full = sorted_indices[within_radius][:max_candidates]
+        selected_distances_full = sorted_distances[within_radius][:max_candidates]
     else:
         fallback_count = min(max_candidates, sorted_indices.size)
-        selected_indices = sorted_indices[:fallback_count]
-        selected_distances = sorted_distances[:fallback_count]
+        selected_indices_full = sorted_indices[:fallback_count]
+        selected_distances_full = sorted_distances[:fallback_count]
+
+    seed_candidates = _to_int(destination.get("seed_candidates"), min(DEFAULT_DESTINATION_SEED_CANDIDATES, max_candidates))
+    seed_candidates = max(1, min(seed_candidates, int(selected_indices_full.size)))
+    selected_indices = selected_indices_full[:seed_candidates]
 
     end_indices = [int(value) for value in selected_indices.tolist()]
     end_penalties = {
         int(stop_idx): int(distance_m / walk_speed_mps)
-        for stop_idx, distance_m in zip(selected_indices, selected_distances)
+        for stop_idx, distance_m in zip(selected_indices_full, selected_distances_full)
     }
 
     metadata = {
@@ -401,9 +476,11 @@ def _select_ends_from_destination(network: TransitNetwork, destination: Any):
             "lat": float(lat),
             "lon": float(lon),
             "radius_m": float(radius_m),
+            "seed_candidates": int(seed_candidates),
             "max_candidates": int(max_candidates),
         },
         "candidate_end_count": len(end_indices),
+        "candidate_end_count_max": int(selected_indices_full.size),
     }
     return end_indices, end_penalties, metadata
 
@@ -467,6 +544,8 @@ def _warmup_raptor(network: TransitNetwork) -> None:
         network.route_board_monotonic,
         network.stop_route_offsets,
         network.stop_routes,
+        network.trip_cost_factors,
+        DEFAULT_RAPTOR_TRANSFER_PENALTY_SECONDS,
         network.transfer_offsets,
         network.transfer_neighbors,
         network.transfer_weights,
@@ -521,6 +600,8 @@ def _compute_segments(
                 network.route_board_monotonic,
                 network.stop_route_offsets,
                 network.stop_routes,
+                network.trip_cost_factors,
+                DEFAULT_RAPTOR_TRANSFER_PENALTY_SECONDS,
                 network.transfer_offsets,
                 network.transfer_neighbors,
                 network.transfer_weights,
@@ -758,6 +839,8 @@ def _find_best_segments_for_od_candidates_raptor(
                 network.route_board_monotonic,
                 network.stop_route_offsets,
                 network.stop_routes,
+                network.trip_cost_factors,
+                DEFAULT_RAPTOR_TRANSFER_PENALTY_SECONDS,
                 network.transfer_offsets,
                 network.transfer_neighbors,
                 network.transfer_weights,
@@ -1030,6 +1113,7 @@ def _build_option_response(
 
     if segments is None:
         return {}
+    option_trip_profile = _summarize_option_trip_profile(network, segments)
     return {
         "departure_time": int(departure_time),
         "resolver_algorithm": resolved_algorithm,
@@ -1044,6 +1128,7 @@ def _build_option_response(
             _segment_payload(network, trip_id, stop_id, arrival_time)
             for trip_id, stop_id, arrival_time in segments
         ],
+        "itinerary_trip_profile": option_trip_profile,
         "raptor_diagnostics": raptor_diagnostics if algorithm == "raptor" else None,
     }
 
@@ -1109,10 +1194,12 @@ def build_multi_departure_response(
         "duration_seconds": None,
         "segments": [],
     }
+    network_trip_profile = summarize_trip_profiles(network)
     return {
         "algorithm": algorithm,
         "candidate_start_count": len(start_indices),
         "candidate_end_count": len(end_indices),
+        "network_trip_profile": network_trip_profile,
         **(metadata or {}),
         "resolver_algorithm": base.get("resolver_algorithm", algorithm),
         "fallback_used": bool(base.get("fallback_used", False)),
@@ -1297,6 +1384,14 @@ def serve(host: str = "0.0.0.0", port: int = 8080) -> ThreadingHTTPServer:
     setup_logging()
     server = ThreadingHTTPServer((host, port), PathRequestHandler)
     PathRequestHandler.network = load_network()
+    trip_profile = summarize_trip_profiles(PathRequestHandler.network)
+    logger.info(
+        "Network trip profile trips=%s unknown_route_type_share=%s top_route_types=%s top_factors=%s",
+        trip_profile.get("trip_count"),
+        trip_profile.get("route_type_unknown_share"),
+        trip_profile.get("route_type_counts_top"),
+        trip_profile.get("factor_counts_top"),
+    )
     logger.info("RAPTOR numba_jit_enabled=%s", numba_enabled())
     try:
         _warmup_raptor(PathRequestHandler.network)
