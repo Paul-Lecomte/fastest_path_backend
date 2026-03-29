@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
 import logging
+import os
 import pickle
 import time
 from pathlib import Path
@@ -17,9 +18,14 @@ logger = logging.getLogger("pathfinding.loader")
 DEFAULT_TRANSFER_WALK_SPEED_MPS = 1.4
 DEFAULT_TRANSFER_MIN_SECONDS = 30
 DEFAULT_TRANSFER_FALLBACK_SECONDS = 120
-DEFAULT_TRANSFER_MAX_DISTANCE_M = 600.0
-DEFAULT_TRANSFER_NEARBY_MAX_DISTANCE_M = 300.0
-DEFAULT_TRANSFER_NEARBY_MAX_NEIGHBORS = 12
+DEFAULT_TRANSFER_MAX_DISTANCE_M = 250.0
+DEFAULT_TRANSFER_NEARBY_MAX_DISTANCE_M = 120.0
+DEFAULT_TRANSFER_NEARBY_MAX_NEIGHBORS = 4
+DEFAULT_WALK_TIME_MULTIPLIER = 15.0
+DEFAULT_TRANSFER_CACHE_PATH = ".cache/walk_transfers_osm.npz"
+DEFAULT_TRANSFER_CACHE_FALLBACK_PATHS = (
+    ".cache/transfer_graph_osrm.npz",
+)
 
 DEFAULT_ROUTE_TYPE_UNKNOWN = -1
 DEFAULT_ROUTE_TYPE_COST_FACTORS = {
@@ -127,6 +133,14 @@ class TransitNetwork:
     station_adj_neighbors: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int32))
     station_adj_weights: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int64))
     hub_station_indices: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int32))
+    # OSM walking graph for detailed pathfinding
+    walking_node_ids: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=object))
+    walking_node_lats: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float64))
+    walking_node_lons: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float64))
+    walking_adj_offsets: np.ndarray = field(default_factory=lambda: np.zeros(1, dtype=np.int64))
+    walking_adj_neighbors: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int32))
+    walking_adj_weights: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int64))
+    stop_to_walking_node_idx: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int32))
 
 
 def _parse_route_type(value) -> int:
@@ -527,7 +541,250 @@ def _build_transfers(
     return transfer_offsets, transfer_neighbors, transfer_weights
 
 
+def _parse_bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _parse_positive_float_env(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return float(default)
+    text = raw.strip()
+    if not text:
+        return float(default)
+    try:
+        value = float(text)
+    except ValueError:
+        return float(default)
+    if not np.isfinite(value) or value <= 0:
+        return float(default)
+    return float(value)
+
+
+def _get_transfer_cache_path() -> str:
+    raw = os.getenv("WALK_TRANSFER_CACHE_PATH", DEFAULT_TRANSFER_CACHE_PATH)
+    configured = raw.strip() if raw and raw.strip() else DEFAULT_TRANSFER_CACHE_PATH
+    if Path(configured).exists():
+        return configured
+
+    for fallback_path in DEFAULT_TRANSFER_CACHE_FALLBACK_PATHS:
+        if Path(fallback_path).exists():
+            logger.info(
+                "Using fallback transfer cache path=%s because configured path is missing path=%s",
+                fallback_path,
+                configured,
+            )
+            return fallback_path
+    return configured
+
+
+def load_transfer_graph_from_cache(
+    cache_path: str,
+    stop_ids: list[str],
+) -> dict | None:
+    path = Path(cache_path)
+    if not path.exists():
+        return None
+
+    try:
+        payload = np.load(path, allow_pickle=True)
+        keys = set(payload.files)
+        required_core = {"transfer_offsets", "transfer_neighbors", "transfer_weights"}
+        if not required_core.issubset(keys):
+            logger.warning("Ignoring transfer cache without transfer arrays path=%s", path)
+            return None
+
+        expected_count = int(len(stop_ids))
+        if "stop_ids" in keys:
+            cached_stop_ids = payload["stop_ids"]
+            expected_stop_ids = np.asarray(stop_ids)
+            if cached_stop_ids.shape != expected_stop_ids.shape:
+                logger.warning(
+                    "Ignoring transfer cache due to stop count mismatch path=%s cache=%s network=%s",
+                    path,
+                    cached_stop_ids.shape[0] if cached_stop_ids.ndim == 1 else -1,
+                    expected_stop_ids.shape[0] if expected_stop_ids.ndim == 1 else -1,
+                )
+                return None
+            if not np.array_equal(cached_stop_ids, expected_stop_ids):
+                logger.warning("Ignoring transfer cache due to stop id mismatch path=%s", path)
+                return None
+        elif "stop_count" in keys:
+            cached_count = int(np.asarray(payload["stop_count"]).reshape(-1)[0])
+            if cached_count != expected_count:
+                logger.warning(
+                    "Ignoring transfer cache due to stop_count mismatch path=%s cache=%s network=%s",
+                    path,
+                    cached_count,
+                    expected_count,
+                )
+                return None
+            logger.info(
+                "Transfer cache path=%s validated by stop_count only (stop_ids not present)",
+                path,
+            )
+        else:
+            logger.warning("Ignoring transfer cache without stop_ids or stop_count metadata path=%s", path)
+            return None
+
+        transfer_offsets = np.asarray(payload["transfer_offsets"], dtype=np.int64)
+        transfer_neighbors = np.asarray(payload["transfer_neighbors"], dtype=np.int32)
+        transfer_weights = np.asarray(payload["transfer_weights"], dtype=np.int64)
+
+        walk_time_multiplier = _parse_positive_float_env("WALK_TIME_MULTIPLIER", DEFAULT_WALK_TIME_MULTIPLIER)
+        if abs(walk_time_multiplier - 1.0) > 1e-9:
+            transfer_weights = np.maximum(
+                1,
+                np.rint(transfer_weights.astype(np.float64) * walk_time_multiplier).astype(np.int64),
+            )
+
+        if transfer_offsets.shape[0] != len(stop_ids) + 1:
+            logger.warning("Ignoring transfer cache due to invalid offsets shape path=%s", path)
+            return None
+        if transfer_neighbors.shape[0] != transfer_weights.shape[0]:
+            logger.warning("Ignoring transfer cache due to neighbors/weights mismatch path=%s", path)
+            return None
+
+        result = {
+            'transfer_offsets': transfer_offsets,
+            'transfer_neighbors': transfer_neighbors,
+            'transfer_weights': transfer_weights,
+        }
+        
+        # Load OSM walking graph data if available
+        keys = set(payload.files)
+        if 'osm_node_ids' in keys:
+            result['walking_node_ids'] = np.asarray(payload['osm_node_ids'], dtype=object)
+        if 'osm_node_lats' in keys:
+            result['walking_node_lats'] = np.asarray(payload['osm_node_lats'], dtype=np.float64)
+        if 'osm_node_lons' in keys:
+            result['walking_node_lons'] = np.asarray(payload['osm_node_lons'], dtype=np.float64)
+        if 'osm_adj_offsets' in keys:
+            result['walking_adj_offsets'] = np.asarray(payload['osm_adj_offsets'], dtype=np.int64)
+        if 'osm_adj_neighbors' in keys:
+            result['walking_adj_neighbors'] = np.asarray(payload['osm_adj_neighbors'], dtype=np.int32)
+        if 'osm_adj_weights' in keys:
+            result['walking_adj_weights'] = np.asarray(payload['osm_adj_weights'], dtype=np.int64)
+        if 'stop_to_node_idx' in keys:
+            result['stop_to_walking_node_idx'] = np.asarray(payload['stop_to_node_idx'], dtype=np.int32)
+        
+        logger.info(
+            "Loaded precomputed transfer cache path=%s stops=%s edges=%s",
+            path,
+            len(stop_ids),
+            transfer_neighbors.shape[0],
+        )
+        return result
+    except Exception as exc:
+        logger.warning("Failed to load transfer cache path=%s error=%s", path, exc)
+        return None
+
+
+def save_transfer_graph_to_cache(
+    cache_path: str,
+    stop_ids: list[str],
+    transfer_offsets: np.ndarray,
+    transfer_neighbors: np.ndarray,
+    transfer_weights: np.ndarray,
+    osm_node_ids: np.ndarray | None = None,
+    osm_node_lats: np.ndarray | None = None,
+    osm_node_lons: np.ndarray | None = None,
+    osm_adj_offsets: np.ndarray | None = None,
+    osm_adj_neighbors: np.ndarray | None = None,
+    osm_adj_weights: np.ndarray | None = None,
+    stop_to_node_idx: np.ndarray | None = None,
+) -> None:
+    path = Path(cache_path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        save_dict = {
+            'stop_ids': np.asarray(stop_ids),
+            'transfer_offsets': np.asarray(transfer_offsets, dtype=np.int64),
+            'transfer_neighbors': np.asarray(transfer_neighbors, dtype=np.int32),
+            'transfer_weights': np.asarray(transfer_weights, dtype=np.int64),
+        }
+        # Save OSM graph data if provided
+        if osm_node_ids is not None:
+            save_dict['osm_node_ids'] = np.asarray(osm_node_ids, dtype=object)
+        if osm_node_lats is not None:
+            save_dict['osm_node_lats'] = np.asarray(osm_node_lats, dtype=np.float64)
+        if osm_node_lons is not None:
+            save_dict['osm_node_lons'] = np.asarray(osm_node_lons, dtype=np.float64)
+        if osm_adj_offsets is not None:
+            save_dict['osm_adj_offsets'] = np.asarray(osm_adj_offsets, dtype=np.int64)
+        if osm_adj_neighbors is not None:
+            save_dict['osm_adj_neighbors'] = np.asarray(osm_adj_neighbors, dtype=np.int32)
+        if osm_adj_weights is not None:
+            save_dict['osm_adj_weights'] = np.asarray(osm_adj_weights, dtype=np.int64)
+        if stop_to_node_idx is not None:
+            save_dict['stop_to_node_idx'] = np.asarray(stop_to_node_idx, dtype=np.int32)
+        
+        np.savez_compressed(path, **save_dict)
+        logger.info(
+            "Saved transfer cache path=%s stops=%s edges=%s",
+            path,
+            len(stop_ids),
+            int(np.asarray(transfer_neighbors).shape[0]),
+        )
+    except Exception as exc:
+        logger.warning("Failed to save transfer cache path=%s error=%s", path, exc)
+
+
+def _load_precomputed_transfer_graph_for_stop_ids(stop_ids: list[str]) -> dict | None:
+    if not _parse_bool_env("WALK_TRANSFER_CACHE_ENABLED", True):
+        return None
+    cache_path = _get_transfer_cache_path()
+    return load_transfer_graph_from_cache(cache_path, stop_ids)
+
+
 def _ensure_transfer_graph(network: TransitNetwork) -> TransitNetwork:
+    # Backward compatibility: old pickled TransitNetwork instances may miss
+    # walking graph fields added in newer versions.
+    if not hasattr(network, "walking_node_ids"):
+        network.walking_node_ids = np.zeros(0, dtype=object)
+    if not hasattr(network, "walking_node_lats"):
+        network.walking_node_lats = np.zeros(0, dtype=np.float64)
+    if not hasattr(network, "walking_node_lons"):
+        network.walking_node_lons = np.zeros(0, dtype=np.float64)
+    if not hasattr(network, "walking_adj_offsets"):
+        network.walking_adj_offsets = np.zeros(1, dtype=np.int64)
+    if not hasattr(network, "walking_adj_neighbors"):
+        network.walking_adj_neighbors = np.zeros(0, dtype=np.int32)
+    if not hasattr(network, "walking_adj_weights"):
+        network.walking_adj_weights = np.zeros(0, dtype=np.int64)
+    if not hasattr(network, "stop_to_walking_node_idx"):
+        network.stop_to_walking_node_idx = np.zeros(0, dtype=np.int32)
+
+    precomputed = _load_precomputed_transfer_graph_for_stop_ids(network.stop_ids)
+    if precomputed is not None:
+        network.transfer_offsets = precomputed['transfer_offsets']
+        network.transfer_neighbors = precomputed['transfer_neighbors']
+        network.transfer_weights = precomputed['transfer_weights']
+        # Load OSM walking graph if available
+        if 'walking_node_ids' in precomputed:
+            network.walking_node_ids = precomputed['walking_node_ids']
+        if 'walking_node_lats' in precomputed:
+            network.walking_node_lats = precomputed['walking_node_lats']
+        if 'walking_node_lons' in precomputed:
+            network.walking_node_lons = precomputed['walking_node_lons']
+        if 'walking_adj_offsets' in precomputed:
+            network.walking_adj_offsets = precomputed['walking_adj_offsets']
+        if 'walking_adj_neighbors' in precomputed:
+            network.walking_adj_neighbors = precomputed['walking_adj_neighbors']
+        if 'walking_adj_weights' in precomputed:
+            network.walking_adj_weights = precomputed['walking_adj_weights']
+        if 'stop_to_walking_node_idx' in precomputed:
+            network.stop_to_walking_node_idx = precomputed['stop_to_walking_node_idx']
+        return network
+
     n_stops = int(network.stops.shape[0])
     offsets = getattr(network, "transfer_offsets", None)
     neighbors = getattr(network, "transfer_neighbors", None)
@@ -543,6 +800,14 @@ def _ensure_transfer_graph(network: TransitNetwork) -> TransitNetwork:
         network.stop_lats,
         network.stop_lons,
     )
+
+    walk_time_multiplier = _parse_positive_float_env("WALK_TIME_MULTIPLIER", DEFAULT_WALK_TIME_MULTIPLIER)
+    if abs(walk_time_multiplier - 1.0) > 1e-9 and transfer_weights.size > 0:
+        transfer_weights = np.maximum(
+            1,
+            np.rint(transfer_weights.astype(np.float64) * walk_time_multiplier).astype(np.int64),
+        )
+
     network.transfer_offsets = transfer_offsets
     network.transfer_neighbors = transfer_neighbors
     network.transfer_weights = transfer_weights
@@ -838,11 +1103,15 @@ class NetworkLoader:
             stop_routes,
         ) = _build_routes(stop_times_array, trip_offsets, len(stop_ids))
 
-        transfer_offsets, transfer_neighbors, transfer_weights = _build_transfers(
-            stop_ids,
-            stop_lats,
-            stop_lons,
-        )
+        precomputed = _load_precomputed_transfer_graph_for_stop_ids(stop_ids)
+        if precomputed is not None:
+            transfer_offsets, transfer_neighbors, transfer_weights = precomputed
+        else:
+            transfer_offsets, transfer_neighbors, transfer_weights = _build_transfers(
+                stop_ids,
+                stop_lats,
+                stop_lons,
+            )
 
         network = TransitNetwork(
             stops=stops_array,
