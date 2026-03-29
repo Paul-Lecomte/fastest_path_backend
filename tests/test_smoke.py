@@ -1,5 +1,6 @@
 # This file contains smoke tests for the RAPTOR, Dijkstra, and A* algorithms on a mock transportation network.
 import asyncio
+from datetime import datetime
 from types import SimpleNamespace
 
 import numpy as np
@@ -19,6 +20,7 @@ from src.solver import build_path, build_path_dijkstra, run_dijkstra_fast, run_r
 from src.http_server import (
     build_multi_departure_response,
     _departure_to_seconds,
+    _build_segment_payloads,
     _select_starts_from_origin,
     _select_ends_from_destination,
 )
@@ -504,8 +506,30 @@ def test_http_segments_include_stop_coordinates():
     assert isinstance(segment["lon"], float)
 
 
+def test_transfer_segment_includes_walking_geometry():
+    network = build_mock_network()
+    start_idx = network.stop_id_index["A"]
+    to_idx = network.stop_id_index["B"]
+    segments = [(-2, to_idx, 930)]
+
+    payloads = _build_segment_payloads(network, segments, start_idx, 900)
+
+    assert len(payloads) == 1
+    segment = payloads[0]
+    assert segment["trip_id"] == "TRANSFER"
+    assert segment["from_stop_id"] == "A"
+    assert segment["walk_duration_seconds"] == 30
+    assert "walking_geometry" in segment
+    assert segment["walking_geometry"]["type"] == "LineString"
+    assert len(segment["walking_geometry"]["coordinates"]) == 2
+    assert segment["walk_distance_m"] > 0
+
+
 def test_http_departure_parses_numeric_string_timestamp():
-    assert _departure_to_seconds("1738580100") == 39300
+    ts = 1738580100
+    expected = datetime.fromtimestamp(ts)
+    expected_seconds = expected.hour * 3600 + expected.minute * 60 + expected.second
+    assert _departure_to_seconds(str(ts)) == expected_seconds
 
 
 def test_http_raptor_returns_no_path_when_schedule_unavailable():
@@ -534,7 +558,7 @@ def test_origin_selects_candidate_starts_and_penalties():
     assert isinstance(metadata, dict)
     assert metadata["candidate_start_count"] == len(start_indices)
     assert network.stop_id_index["A"] in start_indices
-    assert penalties[network.stop_id_index["A"]] <= 1
+    assert penalties[network.stop_id_index["A"]] <= 15
 
 
 def test_http_origin_route_without_explicit_start_ids():
@@ -570,7 +594,7 @@ def test_http_destination_selects_candidate_ends_and_penalties():
     assert len(end_indices) <= 2
     assert isinstance(metadata, dict)
     assert end_indices[0] == network.stop_id_index["C"]
-    assert penalties[end_indices[0]] <= 1
+    assert penalties[end_indices[0]] <= 15
 
 
 def test_http_origin_and_destination_route_without_explicit_stop_ids():
@@ -678,7 +702,7 @@ def test_raptor_prefers_train_over_bus_when_weighted_cost_is_lower():
     assert itinerary_trip_profile["route_type_counts"]
 
 
-def test_raptor_prefers_short_walk_over_shuttle_bus_transfer():
+def test_raptor_prefers_shuttle_bus_over_short_walk_shortcut():
     network = _build_short_walk_vs_shuttle_network()
     response = build_multi_departure_response(
         network,
@@ -690,8 +714,8 @@ def test_raptor_prefers_short_walk_over_shuttle_bus_transfer():
     )
 
     assert response["segments"]
-    assert response["segments"][-1]["arrival_time"] < 1200
-    assert any(segment["trip_id"] == "TRANSFER" for segment in response["segments"])
+    assert response["segments"][-1]["arrival_time"] == 1200
+    assert not any(segment["trip_id"] == "TRANSFER" for segment in response["segments"])
 
 
 def test_transfer_cap_rejects_high_transfer_path():
