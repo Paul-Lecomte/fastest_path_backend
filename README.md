@@ -182,6 +182,8 @@ Optional environment variables:
 - `NETWORK_CACHE_PATH` (default: `.cache/transit_network.pkl`)
 - `NETWORK_CACHE_FORCE_REFRESH` (`true`/`false`, default: `false`)
 - `NETWORK_CACHE_MAX_AGE_SECONDS` (default: `0` meaning no TTL)
+- `WALK_TRANSFER_CACHE_ENABLED` (`true`/`false`, default: `true`)
+- `WALK_TRANSFER_CACHE_PATH` (default: `.cache/walk_transfers_osm.npz`)
 
 You can also create a `.env` file at the project root containing these variables.
 
@@ -189,6 +191,39 @@ Without Neo4j, the server loads a small dummy network for testing.
 Neo4j stop times are parsed from `HH:MM:SS` or numeric values into seconds.
 When cache is enabled, the first successful Neo4j load is persisted to disk and
 subsequent starts reuse the cached network for much faster startup.
+
+### Optional OSM Walking Transfer Precompute
+
+For realistic walking transfers (street-network based instead of straight-line),
+you can precompute transfer edges from an OSM `.pbf` file once and reuse them at startup.
+
+1) Install optional precompute dependencies
+
+```powershell
+python -m pip install pyrosm networkx
+```
+
+If your main runtime is Python 3.13, `pyrosm` may fail to build (upstream `pyrobuf` issue).
+In that case, run precompute once in a dedicated Python 3.12 venv and keep serving with your current env:
+
+```powershell
+py -3.12 -m venv .venv-precompute
+.\.venv-precompute\Scripts\python.exe -m pip install --upgrade pip
+.\.venv-precompute\Scripts\python.exe -m pip install pyrosm networkx
+.\.venv-precompute\Scripts\python.exe -m scripts.precompute_walk_transfers --osm-pbf switzerland.osm.pbf --output .cache/walk_transfers_osm.npz
+```
+
+2) Build the transfer cache
+
+```powershell
+python -m scripts.precompute_walk_transfers --osm-pbf switzerland.osm.pbf --output .cache/walk_transfers_osm.npz
+```
+
+3) Start the server normally
+
+If `WALK_TRANSFER_CACHE_ENABLED=true`, the loader will pick up
+`.cache/walk_transfers_osm.npz` (or the path from `WALK_TRANSFER_CACHE_PATH`)
+and skip rebuilding walking transfers each startup.
 
 ---
 
