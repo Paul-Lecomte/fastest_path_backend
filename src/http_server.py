@@ -5,9 +5,11 @@ import json
 import logging
 import time
 import heapq
+import urllib.parse
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from datetime import datetime, timezone
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
@@ -41,6 +43,7 @@ DEFAULT_ORIGIN_MAX_CANDIDATES = 12
 DEFAULT_ORIGIN_SEED_CANDIDATES = 2
 DEFAULT_DESTINATION_SEED_CANDIDATES = 6
 DEFAULT_WALK_SPEED_MPS = 1.4
+DEFAULT_WALK_TIME_MULTIPLIER = 15.0
 UNIX_TIMESTAMP_MIN_SECONDS = 946684800
 DEFAULT_RAPTOR_ROUNDS_MIN = 8
 DEFAULT_RAPTOR_ROUNDS_MAX = 64
@@ -48,6 +51,14 @@ DEFAULT_ADAPTIVE_EXPANSION_MAX_TIERS = 4
 DEFAULT_RAPTOR_TRANSFER_PENALTY_SECONDS = 3600
 DEFAULT_OPTION_TRANSFER_PENALTY_SECONDS = 3600
 DEFAULT_MAX_TRANSFERS = 4
+DEFAULT_ACCESS_WALK_SCORE_CAP_SECONDS = 900
+DEFAULT_EGRESS_WALK_SCORE_CAP_SECONDS = 900
+DEFAULT_WALK_SCORE_WEIGHT_NUM = 1
+DEFAULT_WALK_SCORE_WEIGHT_DEN = 2
+DEFAULT_WALK_SEGMENT_PENALTY_SECONDS = 900
+DEFAULT_NO_TRANSFER_PREFERENCE_SLACK_SECONDS = 480
+DEFAULT_NO_TRANSFER_CLOSE_EGRESS_SECONDS = 720
+DEFAULT_NO_TRANSFER_CLOSE_SLACK_SECONDS = 900
 
 
 def _snapshot_indices(values: list[int], limit: int = 64) -> list[int]:
@@ -155,6 +166,7 @@ def _rank_origin_candidates_by_connectivity(
     candidate_indices: np.ndarray,
     candidate_distances: np.ndarray,
     walk_speed_mps: float,
+    walk_time_multiplier: float,
 ) -> np.ndarray:
     if candidate_indices.size <= 1:
         return candidate_indices
@@ -167,7 +179,7 @@ def _rank_origin_candidates_by_connectivity(
             row_start = int(network.stop_route_offsets[int(stop_idx)])
             row_end = int(network.stop_route_offsets[int(stop_idx) + 1])
             route_degree = max(0, row_end - row_start)
-        walk_seconds = float(distance_m / max(0.5, float(walk_speed_mps)))
+        walk_seconds = float(distance_m / max(0.5, float(walk_speed_mps))) * float(walk_time_multiplier)
         utility = float(route_degree) * 600.0 - walk_seconds
         ranked_payload.append((utility, float(distance_m), int(stop_idx)))
 
@@ -241,16 +253,91 @@ def _count_transfers(segments) -> int:
     return transfers
 
 
+def _count_walk_segments(segments) -> int:
+    if not segments:
+        return 0
+    return int(sum(1 for trip_id, _, _ in segments if int(trip_id) < 0))
+
+
 def _score_segments_with_transfer_penalty(
     segments,
     base_score: int,
     transfer_penalty_seconds: int = DEFAULT_OPTION_TRANSFER_PENALTY_SECONDS,
+    walk_segment_penalty_seconds: int = DEFAULT_WALK_SEGMENT_PENALTY_SECONDS,
     max_transfers: int = DEFAULT_MAX_TRANSFERS,
 ) -> int:
     transfer_count = int(_count_transfers(segments))
     if transfer_count > int(max_transfers):
         return int(2**62 - 1)
-    return int(base_score) + transfer_count * int(transfer_penalty_seconds)
+    walk_segment_count = int(_count_walk_segments(segments))
+    return (
+        int(base_score)
+        + transfer_count * int(transfer_penalty_seconds)
+        + walk_segment_count * int(walk_segment_penalty_seconds)
+    )
+
+
+def _walk_score_penalty(raw_seconds: int, cap_seconds: int) -> int:
+    bounded_raw = max(0, int(raw_seconds))
+    bounded_cap = max(0, int(cap_seconds))
+    bounded = min(bounded_raw, bounded_cap)
+    return int((bounded * int(DEFAULT_WALK_SCORE_WEIGHT_NUM)) // max(1, int(DEFAULT_WALK_SCORE_WEIGHT_DEN)))
+
+
+def _is_no_transfer_preferred(candidate: dict[str, Any], incumbent: dict[str, Any]) -> bool:
+    candidate_transfers = int(candidate.get("transfers", 0))
+    incumbent_transfers = int(incumbent.get("transfers", 0))
+    if candidate_transfers != 0 or incumbent_transfers == 0:
+        return False
+
+    candidate_arrival = int(candidate.get("arrival_time", 2**62 - 1))
+    incumbent_arrival = int(incumbent.get("arrival_time", 2**62 - 1))
+    if candidate_arrival <= incumbent_arrival + int(DEFAULT_NO_TRANSFER_PREFERENCE_SLACK_SECONDS):
+        return True
+
+    candidate_egress = int(candidate.get("egress_walk_seconds", 2**62 - 1))
+    if candidate_egress <= int(DEFAULT_NO_TRANSFER_CLOSE_EGRESS_SECONDS):
+        return candidate_arrival <= incumbent_arrival + int(DEFAULT_NO_TRANSFER_CLOSE_SLACK_SECONDS)
+    return False
+
+
+def _choose_better_candidate(current: dict[str, Any] | None, candidate: dict[str, Any] | None) -> dict[str, Any] | None:
+    if candidate is None:
+        return current
+    if current is None:
+        return candidate
+
+    if _is_no_transfer_preferred(candidate, current):
+        return candidate
+    if _is_no_transfer_preferred(current, candidate):
+        return current
+
+    candidate_walk_segments = int(candidate.get("walk_segment_count", 2**62 - 1))
+    current_walk_segments = int(current.get("walk_segment_count", 2**62 - 1))
+    if candidate_walk_segments != current_walk_segments:
+        return candidate if candidate_walk_segments < current_walk_segments else current
+
+    candidate_score = int(candidate.get("score", 2**62 - 1))
+    current_score = int(current.get("score", 2**62 - 1))
+    if candidate_score != current_score:
+        return candidate if candidate_score < current_score else current
+
+    candidate_arrival = int(candidate.get("arrival_time", 2**62 - 1))
+    current_arrival = int(current.get("arrival_time", 2**62 - 1))
+    if candidate_arrival != current_arrival:
+        return candidate if candidate_arrival < current_arrival else current
+
+    candidate_transfers = int(candidate.get("transfers", 2**62 - 1))
+    current_transfers = int(current.get("transfers", 2**62 - 1))
+    if candidate_transfers != current_transfers:
+        return candidate if candidate_transfers < current_transfers else current
+
+    candidate_egress = int(candidate.get("egress_walk_seconds", 2**62 - 1))
+    current_egress = int(current.get("egress_walk_seconds", 2**62 - 1))
+    if candidate_egress != current_egress:
+        return candidate if candidate_egress < current_egress else current
+
+    return current
 
 
 def _first_transit_trip_signature(option: dict[str, Any]) -> tuple[str, str | None]:
@@ -330,9 +417,13 @@ def _summarize_option_trip_profile(network: TransitNetwork, segments) -> dict[st
 
 
 def _departure_to_seconds(value: Any) -> int | None:
+    def _from_datetime_local(dt_value: datetime) -> int:
+        local_dt = dt_value.astimezone() if dt_value.tzinfo is not None else dt_value
+        return local_dt.hour * 3600 + local_dt.minute * 60 + local_dt.second
+
     def _from_unix_timestamp(timestamp_value: int) -> int:
-        utc = datetime.fromtimestamp(timestamp_value, tz=timezone.utc)
-        return utc.hour * 3600 + utc.minute * 60 + utc.second
+        local_dt = datetime.fromtimestamp(timestamp_value)
+        return local_dt.hour * 3600 + local_dt.minute * 60 + local_dt.second
 
     def _normalize(value_seconds: int) -> int:
         if abs(value_seconds) >= UNIX_TIMESTAMP_MIN_SECONDS:
@@ -351,7 +442,7 @@ def _departure_to_seconds(value: Any) -> int | None:
             parsed = datetime.fromisoformat(text)
         except ValueError:
             return None
-        return parsed.hour * 3600 + parsed.minute * 60 + parsed.second
+        return _from_datetime_local(parsed)
     return None
 
 
@@ -572,6 +663,302 @@ def _segment_coordinates(network: TransitNetwork, stop_id: int) -> tuple[float |
     return lat, lon
 
 
+def _haversine_distance_point_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    values = _haversine_distance_m(
+        float(lat1),
+        float(lon1),
+        np.asarray([float(lat2)], dtype=np.float64),
+        np.asarray([float(lon2)], dtype=np.float64),
+    )
+    if values.size == 0:
+        return 0.0
+    return float(values[0])
+
+
+def _build_node_buckets(node_lats: np.ndarray, node_lons: np.ndarray, cell_deg: float) -> dict[tuple[int, int], list[int]]:
+    import math
+
+    buckets: dict[tuple[int, int], list[int]] = {}
+    for idx in range(node_lats.shape[0]):
+        lat = float(node_lats[idx])
+        lon = float(node_lons[idx])
+        if not (np.isfinite(lat) and np.isfinite(lon)):
+            continue
+        row = int(math.floor(lat / cell_deg))
+        col = int(math.floor(lon / cell_deg))
+        key = (row, col)
+        if key not in buckets:
+            buckets[key] = []
+        buckets[key].append(int(idx))
+    return buckets
+
+
+def _nearest_node_index_from_buckets(
+    lat: float,
+    lon: float,
+    node_lats: np.ndarray,
+    node_lons: np.ndarray,
+    buckets: dict[tuple[int, int], list[int]],
+    cell_deg: float,
+    max_ring: int = 3,
+) -> int:
+    import math
+
+    row = int(math.floor(float(lat) / cell_deg))
+    col = int(math.floor(float(lon) / cell_deg))
+
+    best_idx = -1
+    best_dist = float("inf")
+    for ring in range(max_ring + 1):
+        found_any = False
+        for d_row in range(-ring, ring + 1):
+            for d_col in range(-ring, ring + 1):
+                for idx in buckets.get((row + d_row, col + d_col), []):
+                    found_any = True
+                    dist = _haversine_distance_point_m(
+                        float(lat),
+                        float(lon),
+                        float(node_lats[idx]),
+                        float(node_lons[idx]),
+                    )
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_idx = int(idx)
+        if found_any and best_idx >= 0:
+            return best_idx
+
+    # Rare fallback when local buckets are empty.
+    if node_lats.size == 0:
+        return -1
+    d_lat = node_lats - float(lat)
+    d_lon = node_lons - float(lon)
+    approx = d_lat * d_lat + d_lon * d_lon
+    return int(np.argmin(approx))
+
+
+def _ensure_runtime_walking_graph(network: TransitNetwork) -> bool:
+    walking_node_ids = getattr(network, "walking_node_ids", np.zeros(0, dtype=object))
+    walking_adj_offsets = getattr(network, "walking_adj_offsets", np.zeros(1, dtype=np.int64))
+    stop_to_walking_node_idx = getattr(network, "stop_to_walking_node_idx", np.zeros(0, dtype=np.int32))
+
+    has_graph = isinstance(walking_node_ids, np.ndarray) and walking_node_ids.size > 0 and isinstance(
+        walking_adj_offsets, np.ndarray
+    ) and walking_adj_offsets.size > 1
+    has_mapping = isinstance(stop_to_walking_node_idx, np.ndarray) and stop_to_walking_node_idx.shape[0] == len(
+        network.stop_ids
+    )
+    if has_graph and has_mapping:
+        return True
+
+    cache_path = ".cache/osm_walking_graph_compact.npz"
+    try:
+        payload = np.load(cache_path, allow_pickle=True)
+    except Exception:
+        return False
+
+    required = {
+        "node_ids",
+        "node_lats",
+        "node_lons",
+        "adj_offsets",
+        "adj_neighbors",
+        "adj_weights",
+    }
+    if not required.issubset(set(payload.files)):
+        return False
+
+    node_ids = np.asarray(payload["node_ids"], dtype=object)
+    node_lats = np.asarray(payload["node_lats"], dtype=np.float64)
+    node_lons = np.asarray(payload["node_lons"], dtype=np.float64)
+    adj_offsets = np.asarray(payload["adj_offsets"], dtype=np.int64)
+    adj_neighbors = np.asarray(payload["adj_neighbors"], dtype=np.int32)
+    adj_weights = np.asarray(payload["adj_weights"], dtype=np.int64)
+
+    if node_ids.size == 0 or adj_offsets.size <= 1:
+        return False
+
+    network.walking_node_ids = node_ids
+    network.walking_node_lats = node_lats
+    network.walking_node_lons = node_lons
+    network.walking_adj_offsets = adj_offsets
+    network.walking_adj_neighbors = adj_neighbors
+    network.walking_adj_weights = adj_weights
+
+    if not has_mapping:
+        cell_deg = 0.01
+        buckets = _build_node_buckets(node_lats, node_lons, cell_deg)
+        mapping = np.full(len(network.stop_ids), -1, dtype=np.int32)
+        for idx in range(len(network.stop_ids)):
+            lat = float(network.stop_lats[idx])
+            lon = float(network.stop_lons[idx])
+            if not (np.isfinite(lat) and np.isfinite(lon)):
+                continue
+            mapping[idx] = int(
+                _nearest_node_index_from_buckets(
+                    lat,
+                    lon,
+                    node_lats,
+                    node_lons,
+                    buckets,
+                    cell_deg,
+                )
+            )
+        network.stop_to_walking_node_idx = mapping
+
+    logger.info(
+        "Loaded runtime OSM walking graph from %s nodes=%s edges=%s",
+        cache_path,
+        int(network.walking_node_ids.shape[0]),
+        int(network.walking_adj_neighbors.shape[0]),
+    )
+    return True
+
+
+def _find_walking_path_via_astar(
+    network: TransitNetwork,
+    from_stop_idx: int,
+    to_stop_idx: int,
+) -> list[tuple[float, float]] | None:
+    """
+    Use A* on the OSM walking graph to find a detailed path between two stops.
+    Returns list of (lat, lon) tuples representing the walking path.
+    If OSM data unavailable or A* fails, returns None.
+    """
+    import math
+    
+    _ensure_runtime_walking_graph(network)
+
+    walking_node_ids = getattr(network, "walking_node_ids", np.zeros(0, dtype=object))
+    walking_node_lats = getattr(network, "walking_node_lats", np.zeros(0, dtype=np.float64))
+    walking_node_lons = getattr(network, "walking_node_lons", np.zeros(0, dtype=np.float64))
+    walking_adj_offsets = getattr(network, "walking_adj_offsets", np.zeros(1, dtype=np.int64))
+    walking_adj_neighbors = getattr(network, "walking_adj_neighbors", np.zeros(0, dtype=np.int32))
+    walking_adj_weights = getattr(network, "walking_adj_weights", np.zeros(0, dtype=np.int64))
+    stop_to_walking_node_idx = getattr(network, "stop_to_walking_node_idx", np.zeros(0, dtype=np.int32))
+
+    # Check if OSM walking graph is available
+    if (
+        walking_node_ids.size == 0
+        or walking_adj_offsets.size <= 1
+        or stop_to_walking_node_idx.size == 0
+    ):
+        return None
+    
+    # Convert stop indices to OSM node indices
+    if from_stop_idx < 0 or from_stop_idx >= stop_to_walking_node_idx.shape[0]:
+        return None
+    if to_stop_idx < 0 or to_stop_idx >= stop_to_walking_node_idx.shape[0]:
+        return None
+    
+    from_node_idx = int(stop_to_walking_node_idx[from_stop_idx])
+    to_node_idx = int(stop_to_walking_node_idx[to_stop_idx])
+    
+    if from_node_idx < 0 or to_node_idx < 0:
+        return None
+    
+    # Run A* on the walking graph
+    try:
+        # Create heuristic weights (distance-based for A*)
+        n_walking_nodes = walking_node_lats.shape[0]
+        
+        # Simple Euclidean heuristic for A* (lat/lon difference as proxy)
+        target_lat = float(walking_node_lats[to_node_idx])
+        target_lon = float(walking_node_lons[to_node_idx])
+        
+        heuristic = np.zeros(n_walking_nodes, dtype=np.int64)
+        for i in range(n_walking_nodes):
+            node_lat = float(walking_node_lats[i])
+            node_lon = float(walking_node_lons[i])
+            # Simple Euclidean distance as heuristic (in seconds at walking speed ~1.4 m/s)
+            # 111km per degree, so 1 degree ~ 111000 meters / 1.4 m/s ~ 79000 seconds
+            approx_dist_m = math.sqrt((node_lat - target_lat) ** 2 + (node_lon - target_lon) ** 2) * 111000
+            heuristic[i] = max(0, int(approx_dist_m / 1.4))
+        
+        dist, pred_stop, _ = run_astar_fast(
+            walking_adj_offsets,
+            walking_adj_neighbors,
+            walking_adj_weights,
+            np.zeros_like(walking_adj_neighbors, dtype=np.int64),
+            int(from_node_idx),
+            int(to_node_idx),
+            0,  # departure_time = 0 for walking
+            heuristic,
+        )
+        
+        # Reconstruct path
+        if dist[int(to_node_idx)] >= 2**61:  # unreachable
+            return None
+        
+        path_nodes = []
+        current_idx = int(to_node_idx)
+        while current_idx != -1:
+            if current_idx < 0 or current_idx >= n_walking_nodes:
+                break
+            lat = float(walking_node_lats[current_idx])
+            lon = float(walking_node_lons[current_idx])
+            if np.isfinite(lat) and np.isfinite(lon):
+                path_nodes.append((lat, lon))
+            if current_idx == int(from_node_idx):
+                break
+            if pred_stop is not None and int(pred_stop[current_idx]) >= 0:
+                current_idx = int(pred_stop[current_idx])
+            else:
+                break
+        
+        path_nodes.reverse()
+        return path_nodes if len(path_nodes) > 0 else None
+    except Exception as exc:
+        logger.warning(f"A* pathfinding failed: {exc}")
+        return None
+
+
+def _find_walking_path_via_osrm(
+    from_lat: float,
+    from_lon: float,
+    to_lat: float,
+    to_lon: float,
+    timeout_seconds: float = 3.0,
+) -> list[tuple[float, float]] | None:
+    """Fallback to OSRM walking route when local OSM graph is unavailable."""
+    try:
+        coords = f"{float(from_lon):.7f},{float(from_lat):.7f};{float(to_lon):.7f},{float(to_lat):.7f}"
+        query = urllib.parse.urlencode(
+            {
+                "overview": "full",
+                "geometries": "geojson",
+                "steps": "false",
+            }
+        )
+        url = f"https://router.project-osrm.org/route/v1/foot/{coords}?{query}"
+        req = urllib.request.Request(url, headers={"User-Agent": "fastest-path-backend/1.0"})
+        with urllib.request.urlopen(req, timeout=float(timeout_seconds)) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+
+        if not isinstance(payload, dict) or payload.get("code") != "Ok":
+            return None
+        routes = payload.get("routes")
+        if not isinstance(routes, list) or not routes:
+            return None
+        geometry = routes[0].get("geometry", {})
+        coordinates = geometry.get("coordinates") if isinstance(geometry, dict) else None
+        if not isinstance(coordinates, list) or len(coordinates) < 2:
+            return None
+
+        result: list[tuple[float, float]] = []
+        for item in coordinates:
+            if not isinstance(item, (list, tuple)) or len(item) < 2:
+                continue
+            lon = float(item[0])
+            lat = float(item[1])
+            if np.isfinite(lat) and np.isfinite(lon):
+                result.append((lat, lon))
+        if len(result) < 2:
+            return None
+        return result
+    except Exception:
+        return None
+
+
 def _segment_payload(network: TransitNetwork, trip_id: int, stop_id: int, arrival_time: int) -> dict[str, Any]:
     lat, lon = _segment_coordinates(network, stop_id)
     trip_value = int(trip_id)
@@ -586,6 +973,85 @@ def _segment_payload(network: TransitNetwork, trip_id: int, stop_id: int, arriva
         "lat": lat,
         "lon": lon,
     }
+
+
+def _build_segment_payloads(
+    network: TransitNetwork,
+    segments,
+    start_stop_idx: int | None,
+    departure_time: int,
+) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    for idx, (trip_id, stop_id, arrival_time) in enumerate(segments):
+        payload = _segment_payload(network, trip_id, stop_id, arrival_time)
+
+        prev_stop_idx: int | None = None
+        prev_time = int(departure_time)
+        if idx > 0:
+            prev_stop_idx = int(segments[idx - 1][1])
+            prev_time = int(segments[idx - 1][2])
+        elif start_stop_idx is not None:
+            prev_stop_idx = int(start_stop_idx)
+
+        if prev_stop_idx is not None:
+            payload["from_stop_id"] = network.stop_ids[int(prev_stop_idx)]
+
+        if int(trip_id) < 0 and prev_stop_idx is not None:
+            to_lat, to_lon = _segment_coordinates(network, int(stop_id))
+            from_lat, from_lon = _segment_coordinates(network, int(prev_stop_idx))
+            walk_duration_seconds = max(0, int(arrival_time) - int(prev_time))
+            payload["walk_duration_seconds"] = int(walk_duration_seconds)
+            if (
+                from_lat is not None
+                and from_lon is not None
+                and to_lat is not None
+                and to_lon is not None
+            ):
+                # Try to get detailed path from OSM walking graph using A*
+                walking_path = _find_walking_path_via_astar(
+                    network,
+                    int(prev_stop_idx),
+                    int(stop_id),
+                )
+
+                if walking_path is None or len(walking_path) == 0:
+                    walking_path = _find_walking_path_via_osrm(
+                        float(from_lat),
+                        float(from_lon),
+                        float(to_lat),
+                        float(to_lon),
+                    )
+                
+                if walking_path is not None and len(walking_path) > 0:
+                    # Use the detailed walking path with all intermediate nodes
+                    coordinates = [[float(lon), float(lat)] for lat, lon in walking_path]
+                    payload["walking_geometry"] = {
+                        "type": "LineString",
+                        "coordinates": coordinates,
+                    }
+                    # Calculate total distance from path
+                    total_distance_m = 0.0
+                    for i in range(len(walking_path) - 1):
+                        lat1, lon1 = walking_path[i]
+                        lat2, lon2 = walking_path[i + 1]
+                        total_distance_m += _haversine_distance_point_m(lat1, lon1, lat2, lon2)
+                    payload["walk_distance_m"] = float(total_distance_m)
+                else:
+                    # Fall back to straight line if OSM graph unavailable or A* fails
+                    payload["walking_geometry"] = {
+                        "type": "LineString",
+                        "coordinates": [
+                            [float(from_lon), float(from_lat)],
+                            [float(to_lon), float(to_lat)],
+                        ],
+                    }
+                    payload["walk_distance_m"] = float(
+                        _haversine_distance_point_m(from_lat, from_lon, to_lat, to_lon)
+                    )
+
+
+        payloads.append(payload)
+    return payloads
 
 
 def _select_starts_from_origin(network: TransitNetwork, origin: Any):
@@ -604,10 +1070,14 @@ def _select_starts_from_origin(network: TransitNetwork, origin: Any):
     max_candidates = _to_int(origin.get("max_candidates"), DEFAULT_ORIGIN_MAX_CANDIDATES)
     if max_candidates <= 0:
         max_candidates = DEFAULT_ORIGIN_MAX_CANDIDATES
+    allow_far_fallback = bool(origin.get("allow_far_fallback", False))
 
     walk_speed_mps = float(origin.get("walk_speed_mps", DEFAULT_WALK_SPEED_MPS))
     if walk_speed_mps <= 0:
         walk_speed_mps = DEFAULT_WALK_SPEED_MPS
+    walk_time_multiplier = float(origin.get("walk_time_multiplier", DEFAULT_WALK_TIME_MULTIPLIER))
+    if walk_time_multiplier <= 0:
+        walk_time_multiplier = DEFAULT_WALK_TIME_MULTIPLIER
 
     valid_mask = np.isfinite(network.stop_lats) & np.isfinite(network.stop_lons)
     valid_indices = np.where(valid_mask)[0]
@@ -628,6 +1098,8 @@ def _select_starts_from_origin(network: TransitNetwork, origin: Any):
     if np.any(within_radius):
         selected_indices_full = sorted_indices[within_radius][:max_candidates]
         selected_distances_full = sorted_distances[within_radius][:max_candidates]
+    elif not allow_far_fallback:
+        return [], {}, "no_nearby_origin_stop"
     else:
         fallback_count = min(max_candidates, sorted_indices.size)
         selected_indices_full = sorted_indices[:fallback_count]
@@ -638,6 +1110,7 @@ def _select_starts_from_origin(network: TransitNetwork, origin: Any):
         selected_indices_full,
         selected_distances_full,
         walk_speed_mps,
+        walk_time_multiplier,
     )
     distance_by_stop = {
         int(stop_idx): float(distance_m)
@@ -651,7 +1124,7 @@ def _select_starts_from_origin(network: TransitNetwork, origin: Any):
 
     start_indices = [int(value) for value in selected_indices.tolist()]
     start_penalties = {
-        int(stop_idx): int(distance_by_stop[int(stop_idx)] / walk_speed_mps)
+        int(stop_idx): int((distance_by_stop[int(stop_idx)] / walk_speed_mps) * walk_time_multiplier)
         for stop_idx in selected_indices_full.tolist()
     }
 
@@ -685,10 +1158,14 @@ def _select_ends_from_destination(network: TransitNetwork, destination: Any):
     max_candidates = _to_int(destination.get("max_candidates"), DEFAULT_ORIGIN_MAX_CANDIDATES)
     if max_candidates <= 0:
         max_candidates = DEFAULT_ORIGIN_MAX_CANDIDATES
+    allow_far_fallback = bool(destination.get("allow_far_fallback", False))
 
     walk_speed_mps = float(destination.get("walk_speed_mps", DEFAULT_WALK_SPEED_MPS))
     if walk_speed_mps <= 0:
         walk_speed_mps = DEFAULT_WALK_SPEED_MPS
+    walk_time_multiplier = float(destination.get("walk_time_multiplier", DEFAULT_WALK_TIME_MULTIPLIER))
+    if walk_time_multiplier <= 0:
+        walk_time_multiplier = DEFAULT_WALK_TIME_MULTIPLIER
 
     valid_mask = np.isfinite(network.stop_lats) & np.isfinite(network.stop_lons)
     valid_indices = np.where(valid_mask)[0]
@@ -709,6 +1186,8 @@ def _select_ends_from_destination(network: TransitNetwork, destination: Any):
     if np.any(within_radius):
         selected_indices_full = sorted_indices[within_radius][:max_candidates]
         selected_distances_full = sorted_distances[within_radius][:max_candidates]
+    elif not allow_far_fallback:
+        return [], {}, "no_nearby_destination_stop"
     else:
         fallback_count = min(max_candidates, sorted_indices.size)
         selected_indices_full = sorted_indices[:fallback_count]
@@ -720,7 +1199,7 @@ def _select_ends_from_destination(network: TransitNetwork, destination: Any):
 
     end_indices = [int(value) for value in selected_indices.tolist()]
     end_penalties = {
-        int(stop_idx): int(distance_m / walk_speed_mps)
+        int(stop_idx): int((distance_m / walk_speed_mps) * walk_time_multiplier)
         for stop_idx, distance_m in zip(selected_indices_full, selected_distances_full)
     }
 
@@ -1011,7 +1490,8 @@ def _find_best_segments_for_starts(
         segments = _compute_segments(network, algorithm, only_start, end_idx, departure_time)
         if not segments:
             return [], None, None
-        penalty = 0 if start_penalties is None else int(start_penalties.get(only_start, 0))
+        penalty_raw = 0 if start_penalties is None else int(start_penalties.get(only_start, 0))
+        penalty = _walk_score_penalty(penalty_raw, DEFAULT_ACCESS_WALK_SCORE_CAP_SECONDS)
         score = _score_segments_with_transfer_penalty(
             segments,
             int(segments[-1][2]) + penalty,
@@ -1037,11 +1517,12 @@ def _find_best_segments_for_starts(
 
     best_segments = []
     best_start = None
-    best_score = None
+    best_candidate = None
     for start_idx, result in zip(start_indices, results):
         if not result:
             continue
-        penalty = 0 if start_penalties is None else int(start_penalties.get(start_idx, 0))
+        penalty_raw = 0 if start_penalties is None else int(start_penalties.get(start_idx, 0))
+        penalty = _walk_score_penalty(penalty_raw, DEFAULT_ACCESS_WALK_SCORE_CAP_SECONDS)
         score = _score_segments_with_transfer_penalty(
             result,
             int(result[-1][2]) + penalty,
@@ -1049,11 +1530,22 @@ def _find_best_segments_for_starts(
         )
         if score >= int(2**62 - 1):
             continue
-        if best_score is None or score < best_score:
-            best_score = score
-            best_segments = result
-            best_start = int(start_idx)
-    return best_segments, best_start, best_score
+        candidate = {
+            "segments": result,
+            "start_idx": int(start_idx),
+            "score": int(score),
+            "arrival_time": int(result[-1][2]),
+            "transfers": int(_count_transfers(result)),
+            "walk_segment_count": int(_count_walk_segments(result)),
+            "egress_walk_seconds": 0,
+        }
+        best_candidate = _choose_better_candidate(best_candidate, candidate)
+
+    if best_candidate is None:
+        return [], None, None
+    best_segments = best_candidate["segments"]
+    best_start = int(best_candidate["start_idx"])
+    return best_segments, best_start, int(best_candidate["score"])
 
 
 def _best_end_from_earliest(
@@ -1086,6 +1578,7 @@ def _find_best_segments_for_od_candidates_raptor(
     max_transfers: int = DEFAULT_MAX_TRANSFERS,
 ):
     budget_caps = list(_raptor_round_budgets(network))
+    inf = int(2**62)
 
     def compute_for_start(start_idx: int):
         attempt_summaries = []
@@ -1116,7 +1609,20 @@ def _find_best_segments_for_od_candidates_raptor(
                 departure_time,
                 max_rounds=max_rounds,
             )
-            best_end, best_end_score = _best_end_from_earliest(earliest, end_indices, end_penalties)
+
+            best_end = None
+            best_end_score = None
+            for end_idx in end_indices:
+                arrival = int(earliest[int(end_idx)])
+                if arrival >= inf:
+                    continue
+                egress_penalty_raw = 0 if end_penalties is None else int(end_penalties.get(int(end_idx), 0))
+                egress_penalty = _walk_score_penalty(egress_penalty_raw, DEFAULT_EGRESS_WALK_SCORE_CAP_SECONDS)
+                score = arrival + egress_penalty
+                if best_end_score is None or score < best_end_score:
+                    best_end_score = score
+                    best_end = int(end_idx)
+
             elapsed_ms = (time.perf_counter() - started) * 1000.0
             rounds_value = int(rounds_used)
             rounds_used_max = max(rounds_used_max, rounds_value)
@@ -1138,41 +1644,66 @@ def _find_best_segments_for_od_candidates_raptor(
             if best_end is None:
                 continue
 
-            segments = build_path(
-                network.stop_times,
-                network.trip_offsets,
-                best_end,
-                earliest,
-                pred_stop,
-                pred_trip,
-                pred_time,
-            )
-            if not segments:
+            best_candidate = None
+            for end_idx in end_indices:
+                arrival = int(earliest[int(end_idx)])
+                if arrival >= inf:
+                    continue
+
+                segments = build_path(
+                    network.stop_times,
+                    network.trip_offsets,
+                    int(end_idx),
+                    earliest,
+                    pred_stop,
+                    pred_trip,
+                    pred_time,
+                )
+                if not segments:
+                    continue
+
+                start_penalty_raw = 0 if start_penalties is None else int(start_penalties.get(int(start_idx), 0))
+                egress_penalty_raw = 0 if end_penalties is None else int(end_penalties.get(int(end_idx), 0))
+                start_penalty = _walk_score_penalty(start_penalty_raw, DEFAULT_ACCESS_WALK_SCORE_CAP_SECONDS)
+                egress_penalty = _walk_score_penalty(egress_penalty_raw, DEFAULT_EGRESS_WALK_SCORE_CAP_SECONDS)
+                total_score = _score_segments_with_transfer_penalty(
+                    segments,
+                    arrival + start_penalty + egress_penalty,
+                    max_transfers=max_transfers,
+                )
+                if total_score >= int(2**62 - 1):
+                    continue
+
+                candidate = {
+                    "segments": segments,
+                    "start_idx": int(start_idx),
+                    "end_idx": int(end_idx),
+                    "score": int(total_score),
+                    "arrival_time": int(arrival),
+                    "transfers": int(_count_transfers(segments)),
+                    "walk_segment_count": int(_count_walk_segments(segments)),
+                    "egress_walk_seconds": int(egress_penalty_raw),
+                }
+                best_candidate = _choose_better_candidate(best_candidate, candidate)
+
+            if best_candidate is None:
                 continue
 
-            start_penalty = 0 if start_penalties is None else int(start_penalties.get(int(start_idx), 0))
-            total_score = _score_segments_with_transfer_penalty(
-                segments,
-                int(best_end_score) + start_penalty,
-                max_transfers=max_transfers,
-            )
-            if total_score >= int(2**62 - 1):
-                continue
             logger.info(
                 "RAPTOR multi-end success start=%s end=%s attempts=%s",
                 start_idx,
-                best_end,
+                int(best_candidate["end_idx"]),
                 " | ".join(attempt_summaries),
             )
             return (
-                segments,
-                int(start_idx),
-                best_end,
-                total_score,
+                best_candidate["segments"],
+                int(best_candidate["start_idx"]),
+                int(best_candidate["end_idx"]),
+                int(best_candidate["score"]),
                 {
                     "success": True,
                     "start_idx": int(start_idx),
-                    "end_idx": int(best_end),
+                    "end_idx": int(best_candidate["end_idx"]),
                     "start_candidates": int(len(start_indices)),
                     "end_candidates": int(len(end_indices)),
                     "attempts": attempt_records,
@@ -1211,7 +1742,7 @@ def _find_best_segments_for_od_candidates_raptor(
     best_segments = []
     best_start = None
     best_end = None
-    best_score = None
+    best_candidate = None
     diagnostics_runs = []
     max_rounds_reached = False
     rounds_used_max = 0
@@ -1222,11 +1753,26 @@ def _find_best_segments_for_od_candidates_raptor(
             rounds_used_max = max(rounds_used_max, int(diag.get("rounds_used_max", 0)))
         if not segments or start_idx is None or end_idx is None or score is None:
             continue
-        if best_score is None or score < best_score:
-            best_score = int(score)
-            best_segments = segments
-            best_start = int(start_idx)
-            best_end = int(end_idx)
+        egress_penalty_raw = 0 if end_penalties is None else int(end_penalties.get(int(end_idx), 0))
+        candidate = {
+            "segments": segments,
+            "start_idx": int(start_idx),
+            "end_idx": int(end_idx),
+            "score": int(score),
+            "arrival_time": int(segments[-1][2]),
+            "transfers": int(_count_transfers(segments)),
+            "walk_segment_count": int(_count_walk_segments(segments)),
+            "egress_walk_seconds": int(egress_penalty_raw),
+        }
+        best_candidate = _choose_better_candidate(best_candidate, candidate)
+
+    if best_candidate is not None:
+        best_segments = best_candidate["segments"]
+        best_start = int(best_candidate["start_idx"])
+        best_end = int(best_candidate["end_idx"])
+        best_score = int(best_candidate["score"])
+    else:
+        best_score = None
 
     diagnostics = {
         "runs": diagnostics_runs,
@@ -1261,7 +1807,7 @@ def _find_best_segments_for_od_candidates(
     best_segments = []
     best_start = None
     best_end = None
-    best_score = None
+    best_candidate = None
 
     for end_idx in end_indices:
         segments, start_idx, start_score = _find_best_segments_for_starts(
@@ -1276,13 +1822,28 @@ def _find_best_segments_for_od_candidates(
         if not segments or start_idx is None or start_score is None:
             continue
 
-        egress_penalty = 0 if end_penalties is None else int(end_penalties.get(int(end_idx), 0))
+        egress_penalty_raw = 0 if end_penalties is None else int(end_penalties.get(int(end_idx), 0))
+        egress_penalty = _walk_score_penalty(egress_penalty_raw, DEFAULT_EGRESS_WALK_SCORE_CAP_SECONDS)
         total_score = int(start_score) + egress_penalty
-        if best_score is None or total_score < best_score:
-            best_score = total_score
-            best_segments = segments
-            best_start = int(start_idx)
-            best_end = int(end_idx)
+        candidate = {
+            "segments": segments,
+            "start_idx": int(start_idx),
+            "end_idx": int(end_idx),
+            "score": int(total_score),
+            "arrival_time": int(segments[-1][2]),
+            "transfers": int(_count_transfers(segments)),
+            "walk_segment_count": int(_count_walk_segments(segments)),
+            "egress_walk_seconds": int(egress_penalty_raw),
+        }
+        best_candidate = _choose_better_candidate(best_candidate, candidate)
+
+    if best_candidate is not None:
+        best_segments = best_candidate["segments"]
+        best_start = int(best_candidate["start_idx"])
+        best_end = int(best_candidate["end_idx"])
+        best_score = int(best_candidate["score"])
+    else:
+        best_score = None
 
     return best_segments, best_start, best_end, best_score, None
 
@@ -1421,10 +1982,12 @@ def _build_option_response(
         "access_walk_seconds": int(start_penalties.get(best_start, 0)) if (best_start is not None and start_penalties) else 0,
         "end_stop_id": network.stop_ids[best_end] if best_end is not None else None,
         "egress_walk_seconds": int(end_penalties.get(best_end, 0)) if (best_end is not None and end_penalties) else 0,
-        "segments": [
-            _segment_payload(network, trip_id, stop_id, arrival_time)
-            for trip_id, stop_id, arrival_time in segments
-        ],
+        "segments": _build_segment_payloads(
+            network,
+            segments,
+            best_start,
+            departure_time,
+        ),
         "itinerary_trip_profile": option_trip_profile,
         "raptor_diagnostics": raptor_diagnostics if algorithm == "raptor" else None,
     }
