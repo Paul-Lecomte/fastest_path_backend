@@ -75,6 +75,12 @@ DEFAULT_WALK_SEGMENT_PENALTY_SECONDS = 900
 DEFAULT_NO_TRANSFER_PREFERENCE_SLACK_SECONDS = 480
 DEFAULT_NO_TRANSFER_CLOSE_EGRESS_SECONDS = 720
 DEFAULT_NO_TRANSFER_CLOSE_SLACK_SECONDS = 900
+DEFAULT_LONG_DISTANCE_RESCUE_MIN_M = 35000.0
+DEFAULT_LONG_DISTANCE_RESCUE_HUBS = 3
+DEFAULT_LONG_DISTANCE_RESCUE_STOPS_PER_HUB = 6
+DEFAULT_LONG_DISTANCE_RESCUE_EXTRA_TRANSFERS = 3
+DEFAULT_LONG_DISTANCE_RESCUE_MAX_TRANSFERS = 8
+DEFAULT_LONG_DISTANCE_BACKBONE_MAX_OFFPATH = 12
 
 
 def _snapshot_indices(values: list[int], limit: int = 64) -> list[int]:
@@ -1299,6 +1305,92 @@ def _select_ends_from_destination(network: TransitNetwork, destination: Any):
     return end_indices, end_penalties, metadata
 
 
+def _nearest_station_indices(network: TransitNetwork, lat: float, lon: float, limit: int) -> list[int]:
+    station_lats = getattr(network, "station_lats", None)
+    station_lons = getattr(network, "station_lons", None)
+    if not isinstance(station_lats, np.ndarray) or not isinstance(station_lons, np.ndarray):
+        return []
+    if station_lats.size == 0 or station_lons.size == 0:
+        return []
+
+    valid = np.isfinite(station_lats) & np.isfinite(station_lons)
+    valid_idx = np.where(valid)[0]
+    if valid_idx.size == 0:
+        return []
+
+    d = _haversine_distance_m(float(lat), float(lon), station_lats[valid_idx], station_lons[valid_idx])
+    order = np.argsort(d)
+    top = valid_idx[order][: max(1, int(limit))]
+    return [int(item) for item in top.tolist()]
+
+
+def _station_to_stop_indices(network: TransitNetwork, station_id: int, limit: int) -> list[int]:
+    offsets = getattr(network, "station_stop_offsets", None)
+    stops = getattr(network, "station_stops", None)
+    if not isinstance(offsets, np.ndarray) or not isinstance(stops, np.ndarray):
+        return []
+    if station_id < 0 or station_id + 1 >= offsets.shape[0]:
+        return []
+
+    row_start = int(offsets[int(station_id)])
+    row_end = int(offsets[int(station_id) + 1])
+    if row_end <= row_start:
+        return []
+    station_stop_ids = [int(item) for item in stops[row_start:row_end].tolist()]
+    return station_stop_ids[: max(1, int(limit))]
+
+
+def _augment_candidates_with_hub_stops(
+    network: TransitNetwork,
+    base_indices: list[int],
+    anchor: dict[str, Any] | None,
+    max_hubs: int = DEFAULT_LONG_DISTANCE_RESCUE_HUBS,
+    max_stops_per_hub: int = DEFAULT_LONG_DISTANCE_RESCUE_STOPS_PER_HUB,
+) -> list[int]:
+    if not isinstance(anchor, dict):
+        return list(base_indices)
+    lat = _to_float(anchor.get("lat"))
+    lon = _to_float(anchor.get("lon"))
+    if lat is None or lon is None:
+        return list(base_indices)
+
+    station_candidates = _nearest_station_indices(network, float(lat), float(lon), int(max_hubs))
+    augmented = list(int(item) for item in base_indices)
+    for station_id in station_candidates:
+        for stop_id in _station_to_stop_indices(network, int(station_id), int(max_stops_per_hub)):
+            augmented.append(int(stop_id))
+    return list(dict.fromkeys(int(item) for item in augmented))
+
+
+def _penalties_for_anchor(
+    network: TransitNetwork,
+    stop_indices: list[int],
+    anchor: dict[str, Any] | None,
+) -> dict[int, int]:
+    if not isinstance(anchor, dict):
+        return {}
+    lat = _to_float(anchor.get("lat"))
+    lon = _to_float(anchor.get("lon"))
+    if lat is None or lon is None:
+        return {}
+
+    walk_speed_mps = float(anchor.get("walk_speed_mps", DEFAULT_WALK_SPEED_MPS))
+    if walk_speed_mps <= 0:
+        walk_speed_mps = DEFAULT_WALK_SPEED_MPS
+    walk_time_multiplier = float(anchor.get("walk_time_multiplier", DEFAULT_WALK_TIME_MULTIPLIER))
+    if walk_time_multiplier <= 0:
+        walk_time_multiplier = DEFAULT_WALK_TIME_MULTIPLIER
+
+    penalties: dict[int, int] = {}
+    for stop_idx in stop_indices:
+        stop_lat, stop_lon = _segment_coordinates(network, int(stop_idx))
+        if stop_lat is None or stop_lon is None:
+            continue
+        distance_m = _haversine_distance_point_m(float(lat), float(lon), float(stop_lat), float(stop_lon))
+        penalties[int(stop_idx)] = int((distance_m / walk_speed_mps) * walk_time_multiplier)
+    return penalties
+
+
 def load_network() -> TransitNetwork:
     from .config import get_neo4j_config, get_network_cache_config
     from .loader import load_network_from_cache, save_network_to_cache
@@ -2048,6 +2140,29 @@ def _build_option_response(
     destination_anchor: dict[str, Any] | None = None,
     max_transfers: int = DEFAULT_MAX_TRANSFERS,
 ) -> dict[str, Any]:
+    od_distance_m = None
+    if isinstance(origin_anchor, dict) and isinstance(destination_anchor, dict):
+        origin_lat = _to_float(origin_anchor.get("lat"))
+        origin_lon = _to_float(origin_anchor.get("lon"))
+        destination_lat = _to_float(destination_anchor.get("lat"))
+        destination_lon = _to_float(destination_anchor.get("lon"))
+        if (
+            origin_lat is not None
+            and origin_lon is not None
+            and destination_lat is not None
+            and destination_lon is not None
+        ):
+            od_distance_m = _haversine_distance_point_m(
+                float(origin_lat),
+                float(origin_lon),
+                float(destination_lat),
+                float(destination_lon),
+            )
+
+    backbone_max_offpath = 2
+    if od_distance_m is not None and float(od_distance_m) >= float(DEFAULT_LONG_DISTANCE_RESCUE_MIN_M):
+        backbone_max_offpath = int(DEFAULT_LONG_DISTANCE_BACKBONE_MAX_OFFPATH)
+
     algorithms = _algorithm_sequence(algorithm)
     station_whitelist, station_backbone_path = _compute_station_backbone(
         network,
@@ -2073,7 +2188,12 @@ def _build_option_response(
             max_transfers,
         )
         if segments and algorithm == "raptor":
-            if not _segments_follow_station_backbone(network, segments, station_whitelist):
+            if not _segments_follow_station_backbone(
+                network,
+                segments,
+                station_whitelist,
+                max_off_path_stations=backbone_max_offpath,
+            ):
                 segments = []
         if selected_algorithm == "raptor":
             raptor_diagnostics = _merge_raptor_diagnostics(raptor_diagnostics, diagnostics)
@@ -2100,7 +2220,12 @@ def _build_option_response(
                         max_transfers,
                     )
                     raptor_diagnostics = _merge_raptor_diagnostics(raptor_diagnostics, tier_diagnostics)
-                    if segments and not _segments_follow_station_backbone(network, segments, station_whitelist):
+                    if segments and not _segments_follow_station_backbone(
+                        network,
+                        segments,
+                        station_whitelist,
+                        max_off_path_stations=backbone_max_offpath,
+                    ):
                         segments = []
                     if segments:
                         logger.info(
@@ -2129,7 +2254,12 @@ def _build_option_response(
                         max_transfers,
                     )
                     raptor_diagnostics = _merge_raptor_diagnostics(raptor_diagnostics, tier_diagnostics)
-                    if segments and not _segments_follow_station_backbone(network, segments, station_whitelist):
+                    if segments and not _segments_follow_station_backbone(
+                        network,
+                        segments,
+                        station_whitelist,
+                        max_off_path_stations=backbone_max_offpath,
+                    ):
                         segments = []
                     if segments:
                         logger.info(
@@ -2138,6 +2268,96 @@ def _build_option_response(
                             len(tier_start_indices),
                         )
                         break
+
+            if not segments and od_distance_m is not None:
+                if od_distance_m >= float(DEFAULT_LONG_DISTANCE_RESCUE_MIN_M):
+                        rescue_start_indices = _augment_candidates_with_hub_stops(
+                            network,
+                            start_indices,
+                            origin_anchor,
+                        )
+                        rescue_end_indices = _augment_candidates_with_hub_stops(
+                            network,
+                            end_indices,
+                            destination_anchor,
+                        )
+                        rescue_start_penalties = dict(start_penalties or {})
+                        rescue_start_penalties.update(
+                            _penalties_for_anchor(network, rescue_start_indices, origin_anchor)
+                        )
+                        rescue_end_penalties = dict(end_penalties or {})
+                        rescue_end_penalties.update(
+                            _penalties_for_anchor(network, rescue_end_indices, destination_anchor)
+                        )
+
+                        rescue_station_whitelist, _ = _compute_station_backbone(
+                            network,
+                            rescue_start_indices,
+                            rescue_end_indices,
+                            max_transfers,
+                        )
+
+                        segments, best_start, best_end, _, rescue_diagnostics = _find_best_segments_for_od_candidates(
+                            network,
+                            selected_algorithm,
+                            rescue_start_indices,
+                            rescue_end_indices,
+                            departure_time,
+                            rescue_start_penalties,
+                            rescue_end_penalties,
+                            max_transfers,
+                        )
+                        raptor_diagnostics = _merge_raptor_diagnostics(raptor_diagnostics, rescue_diagnostics)
+                        if segments and not _segments_follow_station_backbone(
+                            network,
+                            segments,
+                            rescue_station_whitelist,
+                            max_off_path_stations=backbone_max_offpath,
+                        ):
+                            segments = []
+                        if segments:
+                            start_penalties = rescue_start_penalties
+                            end_penalties = rescue_end_penalties
+                            logger.info(
+                                "RAPTOR long-distance rescue hit od_km=%.1f start_candidates=%s end_candidates=%s",
+                                float(od_distance_m) / 1000.0,
+                                len(rescue_start_indices),
+                                len(rescue_end_indices),
+                            )
+
+                        if not segments:
+                            relaxed_max_transfers = min(
+                                int(DEFAULT_LONG_DISTANCE_RESCUE_MAX_TRANSFERS),
+                                int(max_transfers) + int(DEFAULT_LONG_DISTANCE_RESCUE_EXTRA_TRANSFERS),
+                            )
+                            if relaxed_max_transfers > int(max_transfers):
+                                segments, best_start, best_end, _, relaxed_diagnostics = _find_best_segments_for_od_candidates(
+                                    network,
+                                    selected_algorithm,
+                                    rescue_start_indices,
+                                    rescue_end_indices,
+                                    departure_time,
+                                    rescue_start_penalties,
+                                    rescue_end_penalties,
+                                    int(relaxed_max_transfers),
+                                )
+                                raptor_diagnostics = _merge_raptor_diagnostics(raptor_diagnostics, relaxed_diagnostics)
+                                if segments and not _segments_follow_station_backbone(
+                                    network,
+                                    segments,
+                                    rescue_station_whitelist,
+                                    max_off_path_stations=backbone_max_offpath,
+                                ):
+                                    segments = []
+                                if segments:
+                                    start_penalties = rescue_start_penalties
+                                    end_penalties = rescue_end_penalties
+                                    logger.info(
+                                        "RAPTOR long-distance relaxed-transfer rescue hit od_km=%.1f max_transfers=%s->%s",
+                                        float(od_distance_m) / 1000.0,
+                                        int(max_transfers),
+                                        int(relaxed_max_transfers),
+                                    )
 
             if raptor_diagnostics is not None:
                 start_counts, end_counts = _collect_candidate_counts(raptor_diagnostics)
