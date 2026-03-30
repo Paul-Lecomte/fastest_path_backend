@@ -1372,6 +1372,112 @@ def _warmup_raptor(network: TransitNetwork) -> None:
     logger.info("RAPTOR warmup complete in %.2f ms", elapsed_ms)
 
 
+def _select_warmup_stop_pairs(network: TransitNetwork, limit: int = 3) -> list[tuple[int, int]]:
+    pairs: list[tuple[int, int]] = []
+    offsets = getattr(network, "transfer_offsets", None)
+    neighbors = getattr(network, "transfer_neighbors", None)
+
+    if not isinstance(offsets, np.ndarray) or offsets.size <= 1:
+        n_stops = int(network.stop_route_offsets.shape[0] - 1)
+        if n_stops >= 2:
+            return [(0, 1)]
+        return []
+
+    if not isinstance(neighbors, np.ndarray) or neighbors.size == 0:
+        n_stops = int(offsets.shape[0] - 1)
+        if n_stops >= 2:
+            return [(0, 1)]
+        return []
+
+    n_stops = int(offsets.shape[0] - 1)
+    for start_idx in range(n_stops):
+        row_start = int(offsets[start_idx])
+        row_end = int(offsets[start_idx + 1])
+        if row_end <= row_start:
+            continue
+        end_idx = int(neighbors[row_start])
+        if end_idx < 0 or end_idx >= n_stops or end_idx == start_idx:
+            continue
+        pairs.append((int(start_idx), int(end_idx)))
+        if len(pairs) >= int(limit):
+            break
+
+    if pairs:
+        return pairs
+    if n_stops >= 2:
+        return [(0, 1)]
+    return []
+
+
+def _warmup_request_pipeline(network: TransitNetwork) -> None:
+    started = time.perf_counter()
+
+    has_local_walking_graph = False
+    try:
+        has_local_walking_graph = bool(_ensure_runtime_walking_graph(network))
+    except Exception as exc:
+        logger.warning("Runtime walking graph prewarm skipped due to error: %s", exc)
+
+    warmup_pairs = _select_warmup_stop_pairs(network, limit=3)
+    if not warmup_pairs:
+        logger.info("Startup request-pipeline warmup skipped (no candidate stop pairs)")
+        return
+
+    departure_time = int(time.time())
+    warmed_route_cases = 0
+    warmed_walk_cases = 0
+
+    for start_idx, end_idx in warmup_pairs:
+        try:
+            _build_option_response(
+                network,
+                "raptor",
+                [int(start_idx)],
+                [int(end_idx)],
+                departure_time,
+                {int(start_idx): 0},
+                {int(end_idx): 0},
+                None,
+                None,
+                DEFAULT_MAX_TRANSFERS,
+            )
+            warmed_route_cases += 1
+        except Exception as exc:
+            logger.warning(
+                "Startup route warmup case failed start=%s end=%s error=%s",
+                start_idx,
+                end_idx,
+                exc,
+            )
+
+        if has_local_walking_graph:
+            try:
+                walking_path = _find_walking_path_via_astar(
+                    network,
+                    int(start_idx),
+                    int(end_idx),
+                    max_search_seconds=900,
+                )
+                if walking_path:
+                    warmed_walk_cases += 1
+            except Exception as exc:
+                logger.warning(
+                    "Startup walking-path warmup case failed start=%s end=%s error=%s",
+                    start_idx,
+                    end_idx,
+                    exc,
+                )
+
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    logger.info(
+        "Startup request-pipeline warmup complete in %.2f ms route_cases=%s walking_cases=%s local_walking_graph=%s",
+        elapsed_ms,
+        warmed_route_cases,
+        warmed_walk_cases,
+        has_local_walking_graph,
+    )
+
+
 def _raptor_round_budgets(network: TransitNetwork) -> tuple[int, ...]:
     n_stops = int(network.stop_route_offsets.shape[0] - 1)
     adaptive_cap = min(
@@ -2485,6 +2591,10 @@ def serve(host: str = "0.0.0.0", port: int = 8080) -> ThreadingHTTPServer:
         _warmup_raptor(PathRequestHandler.network)
     except Exception as exc:
         logger.warning("RAPTOR warmup skipped due to error: %s", exc)
+    try:
+        _warmup_request_pipeline(PathRequestHandler.network)
+    except Exception as exc:
+        logger.warning("Request-pipeline warmup skipped due to error: %s", exc)
     logger.info("HTTP server listening on %s:%s", host, port)
     return server
 
