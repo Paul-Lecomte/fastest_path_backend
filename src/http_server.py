@@ -5,6 +5,7 @@ import json
 import logging
 import time
 import heapq
+import math
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -29,13 +30,28 @@ from .solver import (
 
 logger = logging.getLogger("pathfinding.http")
 
+# Cache repeated transfer walking paths across options/requests.
+_WALKING_PATH_CACHE_MAX = 20000
+_walking_path_cache: dict[tuple[int, int], list[tuple[float, float]] | None] = {}
+_osrm_path_cache: dict[tuple[float, float, float, float], list[tuple[float, float]] | None] = {}
+_osrm_failure_count = 0
+_osrm_disabled_until = 0.0
+
+DEFAULT_WALKING_PATH_SPEED_MPS = 1.4
+DEFAULT_WALKING_PATH_BUDGET_FACTOR = 3.0
+DEFAULT_WALKING_PATH_BUDGET_SLACK_SECONDS = 600
+DEFAULT_WALKING_PATH_BUDGET_MAX_SECONDS = 3600
+DEFAULT_OSRM_TIMEOUT_SECONDS = 1.2
+DEFAULT_OSRM_FAILURE_BACKOFF_SECONDS = 60.0
+DEFAULT_OSRM_FAILURE_THRESHOLD = 3
+
 DEFAULT_OFFSET_MINUTES: tuple[int, ...] = ()
-DEFAULT_OPTION_COUNT = 3
+DEFAULT_OPTION_COUNT = 1
 DEFAULT_NEXT_OPTION_SEARCH_WINDOW_MINUTES = 90
 DEFAULT_NEXT_OPTION_STEP_SECONDS = 300
 DEFAULT_NEXT_OPTION_MAX_STEP_SECONDS = 1800
-DEFAULT_NEXT_OPTION_MAX_EVALS = 3
-DEFAULT_NEXT_OPTION_MAX_WALL_SECONDS = 8.0
+DEFAULT_NEXT_OPTION_MAX_EVALS = 1
+DEFAULT_NEXT_OPTION_MAX_WALL_SECONDS = 2.0
 DEFAULT_START_EXPANSION_HOPS = 2
 DEFAULT_START_EXPANSION_MAX_STOPS = 256
 DEFAULT_ORIGIN_RADIUS_M = 1000.0
@@ -818,15 +834,20 @@ def _find_walking_path_via_astar(
     network: TransitNetwork,
     from_stop_idx: int,
     to_stop_idx: int,
+    max_search_seconds: int | None = None,
 ) -> list[tuple[float, float]] | None:
     """
     Use A* on the OSM walking graph to find a detailed path between two stops.
     Returns list of (lat, lon) tuples representing the walking path.
     If OSM data unavailable or A* fails, returns None.
     """
-    import math
-    
     _ensure_runtime_walking_graph(network)
+
+    budget_key = -1 if max_search_seconds is None else int(max_search_seconds)
+    cache_key = (int(from_stop_idx), int(to_stop_idx), budget_key)
+    cached = _walking_path_cache.get(cache_key)
+    if cache_key in _walking_path_cache:
+        return cached
 
     walking_node_ids = getattr(network, "walking_node_ids", np.zeros(0, dtype=object))
     walking_node_lats = getattr(network, "walking_node_lats", np.zeros(0, dtype=np.float64))
@@ -856,57 +877,82 @@ def _find_walking_path_via_astar(
     if from_node_idx < 0 or to_node_idx < 0:
         return None
     
-    # Run A* on the walking graph
+    # Run bounded dynamic A* without full-graph heuristic allocation.
     try:
-        # Create heuristic weights (distance-based for A*)
-        n_walking_nodes = walking_node_lats.shape[0]
-        
-        # Simple Euclidean heuristic for A* (lat/lon difference as proxy)
-        target_lat = float(walking_node_lats[to_node_idx])
-        target_lon = float(walking_node_lons[to_node_idx])
-        
-        heuristic = np.zeros(n_walking_nodes, dtype=np.int64)
-        for i in range(n_walking_nodes):
-            node_lat = float(walking_node_lats[i])
-            node_lon = float(walking_node_lons[i])
-            # Simple Euclidean distance as heuristic (in seconds at walking speed ~1.4 m/s)
-            # 111km per degree, so 1 degree ~ 111000 meters / 1.4 m/s ~ 79000 seconds
-            approx_dist_m = math.sqrt((node_lat - target_lat) ** 2 + (node_lon - target_lon) ** 2) * 111000
-            heuristic[i] = max(0, int(approx_dist_m / 1.4))
-        
-        dist, pred_stop, _ = run_astar_fast(
-            walking_adj_offsets,
-            walking_adj_neighbors,
-            walking_adj_weights,
-            np.zeros_like(walking_adj_neighbors, dtype=np.int64),
-            int(from_node_idx),
-            int(to_node_idx),
-            0,  # departure_time = 0 for walking
-            heuristic,
-        )
-        
-        # Reconstruct path
-        if dist[int(to_node_idx)] >= 2**61:  # unreachable
-            return None
-        
-        path_nodes = []
-        current_idx = int(to_node_idx)
-        while current_idx != -1:
-            if current_idx < 0 or current_idx >= n_walking_nodes:
+        src = int(from_node_idx)
+        dst = int(to_node_idx)
+        if src == dst:
+            result = [
+                (float(walking_node_lats[src]), float(walking_node_lons[src])),
+                (float(walking_node_lats[dst]), float(walking_node_lons[dst])),
+            ]
+            if len(_walking_path_cache) >= _WALKING_PATH_CACHE_MAX:
+                _walking_path_cache.pop(next(iter(_walking_path_cache)))
+            _walking_path_cache[cache_key] = result
+            return result
+
+        budget = DEFAULT_WALKING_PATH_BUDGET_MAX_SECONDS if max_search_seconds is None else int(max_search_seconds)
+        budget = max(60, min(DEFAULT_WALKING_PATH_BUDGET_MAX_SECONDS, budget))
+
+        target_lat = float(walking_node_lats[dst])
+        target_lon = float(walking_node_lons[dst])
+
+        dist: dict[int, int] = {src: 0}
+        pred: dict[int, int] = {src: -1}
+
+        def _h_seconds(node_idx: int) -> int:
+            d_m = _haversine_distance_point_m(
+                float(walking_node_lats[node_idx]),
+                float(walking_node_lons[node_idx]),
+                target_lat,
+                target_lon,
+            )
+            return int(d_m / DEFAULT_WALKING_PATH_SPEED_MPS)
+
+        heap: list[tuple[int, int, int]] = [(_h_seconds(src), 0, src)]
+        found = False
+
+        while heap:
+            _, g, u = heapq.heappop(heap)
+            if g != dist.get(u):
+                continue
+            if g > budget:
+                continue
+            if u == dst:
+                found = True
                 break
-            lat = float(walking_node_lats[current_idx])
-            lon = float(walking_node_lons[current_idx])
-            if np.isfinite(lat) and np.isfinite(lon):
-                path_nodes.append((lat, lon))
-            if current_idx == int(from_node_idx):
-                break
-            if pred_stop is not None and int(pred_stop[current_idx]) >= 0:
-                current_idx = int(pred_stop[current_idx])
-            else:
-                break
-        
-        path_nodes.reverse()
-        return path_nodes if len(path_nodes) > 0 else None
+
+            row_start = int(walking_adj_offsets[u])
+            row_end = int(walking_adj_offsets[u + 1])
+            for edge_idx in range(row_start, row_end):
+                v = int(walking_adj_neighbors[edge_idx])
+                alt = int(g + int(walking_adj_weights[edge_idx]))
+                if alt > budget:
+                    continue
+                prev = dist.get(v)
+                if prev is None or alt < prev:
+                    dist[v] = alt
+                    pred[v] = u
+                    heapq.heappush(heap, (alt + _h_seconds(v), alt, v))
+
+        if not found:
+            result = None
+        else:
+            path_nodes: list[tuple[float, float]] = []
+            current_idx = dst
+            while current_idx != -1:
+                lat = float(walking_node_lats[current_idx])
+                lon = float(walking_node_lons[current_idx])
+                if np.isfinite(lat) and np.isfinite(lon):
+                    path_nodes.append((lat, lon))
+                current_idx = int(pred.get(current_idx, -1))
+            path_nodes.reverse()
+            result = path_nodes if len(path_nodes) > 0 else None
+
+        if len(_walking_path_cache) >= _WALKING_PATH_CACHE_MAX:
+            _walking_path_cache.pop(next(iter(_walking_path_cache)))
+        _walking_path_cache[cache_key] = result
+        return result
     except Exception as exc:
         logger.warning(f"A* pathfinding failed: {exc}")
         return None
@@ -920,6 +966,21 @@ def _find_walking_path_via_osrm(
     timeout_seconds: float = 3.0,
 ) -> list[tuple[float, float]] | None:
     """Fallback to OSRM walking route when local OSM graph is unavailable."""
+    global _osrm_failure_count, _osrm_disabled_until
+
+    now = time.time()
+    if now < _osrm_disabled_until:
+        return None
+
+    cache_key = (
+        round(float(from_lat), 6),
+        round(float(from_lon), 6),
+        round(float(to_lat), 6),
+        round(float(to_lon), 6),
+    )
+    if cache_key in _osrm_path_cache:
+        return _osrm_path_cache[cache_key]
+
     try:
         coords = f"{float(from_lon):.7f},{float(from_lat):.7f};{float(to_lon):.7f},{float(to_lat):.7f}"
         query = urllib.parse.urlencode(
@@ -953,9 +1014,18 @@ def _find_walking_path_via_osrm(
             if np.isfinite(lat) and np.isfinite(lon):
                 result.append((lat, lon))
         if len(result) < 2:
+            _osrm_path_cache[cache_key] = None
             return None
+        if len(_osrm_path_cache) >= _WALKING_PATH_CACHE_MAX:
+            _osrm_path_cache.pop(next(iter(_osrm_path_cache)))
+        _osrm_path_cache[cache_key] = result
+        _osrm_failure_count = 0
         return result
     except Exception:
+        _osrm_path_cache[cache_key] = None
+        _osrm_failure_count += 1
+        if _osrm_failure_count >= DEFAULT_OSRM_FAILURE_THRESHOLD:
+            _osrm_disabled_until = time.time() + DEFAULT_OSRM_FAILURE_BACKOFF_SECONDS
         return None
 
 
@@ -1008,10 +1078,21 @@ def _build_segment_payloads(
                 and to_lon is not None
             ):
                 # Try to get detailed path from OSM walking graph using A*
+                search_budget = min(
+                    DEFAULT_WALKING_PATH_BUDGET_MAX_SECONDS,
+                    int(
+                        max(
+                            DEFAULT_WALKING_PATH_BUDGET_SLACK_SECONDS,
+                            float(walk_duration_seconds) * DEFAULT_WALKING_PATH_BUDGET_FACTOR
+                            + DEFAULT_WALKING_PATH_BUDGET_SLACK_SECONDS,
+                        )
+                    ),
+                )
                 walking_path = _find_walking_path_via_astar(
                     network,
                     int(prev_stop_idx),
                     int(stop_id),
+                    max_search_seconds=int(search_budget),
                 )
 
                 if walking_path is None or len(walking_path) == 0:
@@ -1020,6 +1101,7 @@ def _build_segment_payloads(
                         float(from_lon),
                         float(to_lat),
                         float(to_lon),
+                        timeout_seconds=DEFAULT_OSRM_TIMEOUT_SECONDS,
                     )
                 
                 if walking_path is not None and len(walking_path) > 0:
@@ -2004,6 +2086,9 @@ def build_multi_departure_response(
     end_penalties: dict[int, int] | None = None,
     metadata: dict[str, Any] | None = None,
     max_transfers: int = DEFAULT_MAX_TRANSFERS,
+    option_count: int = DEFAULT_OPTION_COUNT,
+    next_option_max_evals: int = DEFAULT_NEXT_OPTION_MAX_EVALS,
+    next_option_max_wall_seconds: float = DEFAULT_NEXT_OPTION_MAX_WALL_SECONDS,
 ) -> dict[str, Any]:
     if isinstance(end_idx, list):
         end_indices = [int(value) for value in end_idx]
@@ -2014,6 +2099,10 @@ def build_multi_departure_response(
     destination_anchor = metadata.get("destination") if isinstance(metadata, dict) else None
 
     options: list[dict[str, Any]] = []
+
+    requested_option_count = max(1, int(option_count))
+    eval_budget = max(0, int(next_option_max_evals))
+    wall_budget_s = max(0.1, float(next_option_max_wall_seconds))
 
     if offset_minutes:
         options = [None] * len(offset_minutes)
@@ -2074,7 +2163,7 @@ def build_multi_departure_response(
         max_lookahead_seconds = int(DEFAULT_NEXT_OPTION_SEARCH_WINDOW_MINUTES * 60)
         step_seconds = max(60, int(DEFAULT_NEXT_OPTION_STEP_SECONDS))
         max_step_seconds = max(step_seconds, int(DEFAULT_NEXT_OPTION_MAX_STEP_SECONDS))
-        while len(options) < int(DEFAULT_OPTION_COUNT):
+        while len(options) < requested_option_count:
             previous_signature = _first_transit_trip_signature(options[-1])
             previous_departure = int(options[-1].get("departure_time", current_departure))
             search_departure = previous_departure + step_seconds
@@ -2084,9 +2173,9 @@ def build_multi_departure_response(
             same_signature_streak = 0
 
             while search_departure <= search_limit:
-                if next_option_evals >= int(DEFAULT_NEXT_OPTION_MAX_EVALS):
+                if next_option_evals >= eval_budget:
                     break
-                if (time.perf_counter() - next_option_started) >= float(DEFAULT_NEXT_OPTION_MAX_WALL_SECONDS):
+                if (time.perf_counter() - next_option_started) >= wall_budget_s:
                     break
                 candidate = _build_option_response(
                     network,
@@ -2113,13 +2202,13 @@ def build_multi_departure_response(
                 search_departure += search_step_seconds
 
             if not found_next:
-                if next_option_evals >= int(DEFAULT_NEXT_OPTION_MAX_EVALS):
+                if next_option_evals >= eval_budget:
                     logger.info(
                         "Dynamic next-option search stopped by evaluation budget evals=%s options=%s",
                         next_option_evals,
                         len(options),
                     )
-                elif (time.perf_counter() - next_option_started) >= float(DEFAULT_NEXT_OPTION_MAX_WALL_SECONDS):
+                elif (time.perf_counter() - next_option_started) >= wall_budget_s:
                     logger.info(
                         "Dynamic next-option search stopped by wall-time budget elapsed=%.2fs options=%s evals=%s",
                         (time.perf_counter() - next_option_started),
@@ -2174,6 +2263,9 @@ class PathRequestHandler(BaseHTTPRequestHandler):
         destination = payload.get("destination")
         end_stop_id = payload.get("end_stop_id")
         max_transfers_raw = payload.get("max_transfers")
+        option_count_raw = payload.get("option_count")
+        next_option_max_evals_raw = payload.get("next_option_max_evals")
+        next_option_max_wall_seconds_raw = payload.get("next_option_max_wall_seconds")
         departure_raw = payload.get("departure_time")
         algorithm = payload.get("algorithm", "raptor")
         offset_minutes_payload = payload.get("offset_minutes")
@@ -2217,6 +2309,43 @@ class PathRequestHandler(BaseHTTPRequestHandler):
                 return
         if max_transfers < 0:
             self._send_json(400, {"error": "invalid_max_transfers"})
+            return
+
+        option_count = int(DEFAULT_OPTION_COUNT)
+        if option_count_raw is not None:
+            if isinstance(option_count_raw, (int, float)):
+                option_count = int(option_count_raw)
+            elif isinstance(option_count_raw, str) and option_count_raw.strip().lstrip("-").isdigit():
+                option_count = int(option_count_raw.strip())
+            else:
+                self._send_json(400, {"error": "invalid_option_count"})
+                return
+        if option_count < 1:
+            self._send_json(400, {"error": "invalid_option_count"})
+            return
+
+        next_option_max_evals = int(DEFAULT_NEXT_OPTION_MAX_EVALS)
+        if next_option_max_evals_raw is not None:
+            if isinstance(next_option_max_evals_raw, (int, float)):
+                next_option_max_evals = int(next_option_max_evals_raw)
+            elif isinstance(next_option_max_evals_raw, str) and next_option_max_evals_raw.strip().lstrip("-").isdigit():
+                next_option_max_evals = int(next_option_max_evals_raw.strip())
+            else:
+                self._send_json(400, {"error": "invalid_next_option_max_evals"})
+                return
+        if next_option_max_evals < 0:
+            self._send_json(400, {"error": "invalid_next_option_max_evals"})
+            return
+
+        next_option_max_wall_seconds = float(DEFAULT_NEXT_OPTION_MAX_WALL_SECONDS)
+        if next_option_max_wall_seconds_raw is not None:
+            value = _to_float(next_option_max_wall_seconds_raw)
+            if value is None:
+                self._send_json(400, {"error": "invalid_next_option_max_wall_seconds"})
+                return
+            next_option_max_wall_seconds = float(value)
+        if next_option_max_wall_seconds <= 0:
+            self._send_json(400, {"error": "invalid_next_option_max_wall_seconds"})
             return
 
         if self.network is None:
@@ -2291,6 +2420,9 @@ class PathRequestHandler(BaseHTTPRequestHandler):
             end_penalties=end_penalties,
             metadata=metadata,
             max_transfers=max_transfers,
+            option_count=option_count,
+            next_option_max_evals=next_option_max_evals,
+            next_option_max_wall_seconds=next_option_max_wall_seconds,
         )
         logger.info(
             "HTTP /path algorithm=%s starts=%s ends=%s departure=%s options=%s",
