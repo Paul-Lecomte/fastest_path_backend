@@ -22,7 +22,7 @@ def numba_enabled() -> bool:
     return bool(_NUMBA_AVAILABLE)
 
 
-@njit(cache=True)
+@njit(cache=False)
 def _lower_bound_int64(values, start: int, end: int, target: int):
     left = start
     right = end
@@ -35,7 +35,7 @@ def _lower_bound_int64(values, start: int, end: int, target: int):
     return left
 
 
-@njit(cache=True)
+@njit(cache=False)
 def run_raptor_with_stats(
     stop_times,
     trip_offsets,
