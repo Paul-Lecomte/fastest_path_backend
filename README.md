@@ -27,7 +27,7 @@ It loads GTFS-like data (via Neo4j or a dummy dataset), runs fast earliest-arriv
 - Long-distance route planning with adaptive candidate expansion
 - Optional Neo4j storage for graph and stop times
 - HTTP endpoint for fastest-path queries
-- Multiple departure options (+10/20/30/40 minutes) computed in parallel
+- Multiple departure options (default 3) computed in parallel for better user choice
 - Automatic fallback from RAPTOR → A* → Dijkstra for reliability
 
 ---
@@ -112,6 +112,9 @@ Response:
 `resolver_algorithm` indicates the algorithm that actually produced the path.
 When RAPTOR cannot find a path for a query, the service automatically falls back
 to A* then Dijkstra for reliability (`fallback_used=true`).
+
+**Multiple Options:** By default, the API returns 3 different departure times within a 90-minute search window.
+You can customize this with the `option_count` parameter in the request (default: 3).
 
 For RAPTOR requests, each option now includes `raptor_diagnostics` with round-cap
 attempt metadata and no-path reasons (`no_path_reason`) to help debug difficult

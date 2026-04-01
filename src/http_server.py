@@ -46,12 +46,12 @@ DEFAULT_OSRM_FAILURE_BACKOFF_SECONDS = 60.0
 DEFAULT_OSRM_FAILURE_THRESHOLD = 3
 
 DEFAULT_OFFSET_MINUTES: tuple[int, ...] = ()
-DEFAULT_OPTION_COUNT = 1
+DEFAULT_OPTION_COUNT = 3
 DEFAULT_NEXT_OPTION_SEARCH_WINDOW_MINUTES = 90
 DEFAULT_NEXT_OPTION_STEP_SECONDS = 300
 DEFAULT_NEXT_OPTION_MAX_STEP_SECONDS = 1800
-DEFAULT_NEXT_OPTION_MAX_EVALS = 1
-DEFAULT_NEXT_OPTION_MAX_WALL_SECONDS = 2.0
+DEFAULT_NEXT_OPTION_MAX_EVALS = 10
+DEFAULT_NEXT_OPTION_MAX_WALL_SECONDS = 8.0
 DEFAULT_START_EXPANSION_HOPS = 2
 DEFAULT_START_EXPANSION_MAX_STOPS = 256
 DEFAULT_ORIGIN_RADIUS_M = 1000.0
@@ -1071,12 +1071,33 @@ def _build_segment_payloads(
 
         if prev_stop_idx is not None:
             payload["from_stop_id"] = network.stop_ids[int(prev_stop_idx)]
+            # Add from_stop_name for user friendliness
+            if hasattr(network, 'stop_names') and network.stop_names is not None:
+                from_name = network.stop_names[int(prev_stop_idx)] if int(prev_stop_idx) < len(network.stop_names) else None
+                if from_name:
+                    payload["from_stop_name"] = str(from_name)
 
         if int(trip_id) < 0 and prev_stop_idx is not None:
             to_lat, to_lon = _segment_coordinates(network, int(stop_id))
             from_lat, from_lon = _segment_coordinates(network, int(prev_stop_idx))
             walk_duration_seconds = max(0, int(arrival_time) - int(prev_time))
             payload["walk_duration_seconds"] = int(walk_duration_seconds)
+            
+            # Add to_stop_name for walking segments
+            if hasattr(network, 'stop_names') and network.stop_names is not None:
+                to_name = network.stop_names[int(stop_id)] if int(stop_id) < len(network.stop_names) else None
+                if to_name:
+                    payload["to_stop_name"] = str(to_name)
+            
+            # Determine walking segment type
+            if idx == 0 or (idx > 0 and int(segments[idx-1][1]) == int(start_stop_idx or prev_stop_idx)):
+                segment_type = "access"
+            elif idx == len(segments) - 1:
+                segment_type = "egress"
+            else:
+                segment_type = "transfer"
+            payload["walking_segment_type"] = segment_type
+            
             if (
                 from_lat is not None
                 and from_lon is not None
@@ -1100,7 +1121,8 @@ def _build_segment_payloads(
                     int(stop_id),
                     max_search_seconds=int(search_budget),
                 )
-
+                
+                routing_method = "osm"
                 if walking_path is None or len(walking_path) == 0:
                     walking_path = _find_walking_path_via_osrm(
                         float(from_lat),
@@ -1109,6 +1131,7 @@ def _build_segment_payloads(
                         float(to_lon),
                         timeout_seconds=DEFAULT_OSRM_TIMEOUT_SECONDS,
                     )
+                    routing_method = "osrm" if walking_path is not None and len(walking_path) > 0 else "straight_line"
                 
                 if walking_path is not None and len(walking_path) > 0:
                     # Use the detailed walking path with all intermediate nodes
@@ -1126,6 +1149,7 @@ def _build_segment_payloads(
                     payload["walk_distance_m"] = float(total_distance_m)
                 else:
                     # Fall back to straight line if OSM graph unavailable or A* fails
+                    routing_method = "straight_line"
                     payload["walking_geometry"] = {
                         "type": "LineString",
                         "coordinates": [
@@ -1136,6 +1160,16 @@ def _build_segment_payloads(
                     payload["walk_distance_m"] = float(
                         _haversine_distance_point_m(from_lat, from_lon, to_lat, to_lon)
                     )
+                
+                # Add routing method indicator
+                payload["routing_method"] = routing_method
+                
+                # Calculate and add walking speed in km/h
+                walk_distance_m = payload.get("walk_distance_m", 0.0)
+                if walk_duration_seconds > 0 and walk_distance_m > 0:
+                    walk_speed_mps = float(walk_distance_m) / float(walk_duration_seconds)
+                    walk_speed_kmh = walk_speed_mps * 3.6
+                    payload["walking_speed_kmh"] = round(float(walk_speed_kmh), 2)
 
 
         payloads.append(payload)
