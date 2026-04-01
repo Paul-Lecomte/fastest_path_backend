@@ -34,7 +34,7 @@ It loads GTFS-like data (via Neo4j or a dummy dataset), runs fast earliest-arriv
 
 ## Tech Stack
 
-- Language: Python 3.12 (required for Numba JIT acceleration)
+- Language: Python 3.12+ (Numba JIT supported on Python 3.13)
 - Acceleration: NumPy, Numba (JIT-compiled RAPTOR)
 - Storage: Neo4j (optional)
 - APIs: HTTP + gRPC
@@ -145,7 +145,7 @@ message PathRequest {
 
 ## Prerequisites
 
-- Python 3.12 (required for Numba JIT acceleration; 3.13+ supported but runs without JIT)
+- Python 3.12 or 3.13
 - Optional: Neo4j running locally or remotely
 
 ---
@@ -231,13 +231,13 @@ and skip rebuilding walking transfers each startup.
 
 ## Performance & Python Version Notes
 
-**Recommended:** Python 3.12 with Numba JIT enabled
-- Numba is available for Python 3.12 and earlier
+**Recommended:** Python 3.12 or 3.13 with Numba JIT enabled
+- Numba is available on both Python 3.12 and 3.13 in this project setup
 - RAPTOR runs with Numba JIT: ~150-450ms per query on long-distance routes
-- Without Numba JIT (Python 3.13+): 100-1000x slower (requires pure Python fallback)
+- Without Numba JIT: 100-1000x slower (pure Python fallback)
 
 The service auto-detects Numba availability at startup and logs `RAPTOR numba_jit_enabled=True/False`.
-For best performance, use Python 3.12 with dependencies from `requirements.txt`.
+For best performance, install dependencies from `requirements.txt` and verify startup logs show `RAPTOR numba_jit_enabled=True`.
 
 ---
 
