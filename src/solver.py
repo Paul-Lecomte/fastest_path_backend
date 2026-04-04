@@ -57,6 +57,7 @@ def run_raptor_with_stats(
     end_stop_id: int,
     departure_time: int,
     max_rounds: int = 6,
+    max_transfers: int = 4,
 ):
     n_stops = stop_route_offsets.shape[0] - 1
     n_routes = route_stop_offsets.shape[0] - 1
@@ -74,8 +75,11 @@ def run_raptor_with_stats(
     transfer_penalty_cost = np.int64(max(0, int(transfer_penalty_seconds))) * cost_scale
     transfer_walk_penalty_cost = transfer_penalty_cost
     transfer_board_buffer_seconds = np.int64(min(10, max(0, int(transfer_penalty_seconds)) // 60))
+    max_allowed_transfers = np.int64(max(0, int(max_transfers)))
+    inf_transfers = np.int64(2**30)
     earliest = np.full(n_stops, inf, dtype=np.int64)
     best_cost = np.full(n_stops, inf, dtype=np.int64)
+    best_transfers = np.full(n_stops, inf_transfers, dtype=np.int64)
     best_walk_seconds = np.full(n_stops, inf, dtype=np.int64)
     pred_stop = np.full(n_stops, -1, dtype=np.int64)
     pred_trip = np.full(n_stops, -1, dtype=np.int64)
@@ -91,6 +95,7 @@ def run_raptor_with_stats(
 
     earliest[start_stop_id] = departure_time
     best_cost[start_stop_id] = np.int64(departure_time) * cost_scale
+    best_transfers[start_stop_id] = np.int64(0)
     best_walk_seconds[start_stop_id] = np.int64(0)
     marked[start_stop_id] = 1
     marked_list[0] = np.int64(start_stop_id)
@@ -117,15 +122,22 @@ def run_raptor_with_stats(
             + weighted_walk_time * cost_scale
             + transfer_walk_penalty_cost
         )
-        should_update = transfer_cost < best_cost[to_stop] or (
-            transfer_cost == best_cost[to_stop] and (
-                next_walk < best_walk_seconds[to_stop]
-                or (next_walk == best_walk_seconds[to_stop] and arrival_via_transfer < earliest[to_stop])
+        transfer_count = np.int64(0)
+        should_update = transfer_count < best_transfers[to_stop] or (
+            transfer_count == best_transfers[to_stop] and (
+                transfer_cost < best_cost[to_stop]
+                or (
+                    transfer_cost == best_cost[to_stop] and (
+                        next_walk < best_walk_seconds[to_stop]
+                        or (next_walk == best_walk_seconds[to_stop] and arrival_via_transfer < earliest[to_stop])
+                    )
+                )
             )
         )
         if should_update:
             earliest[to_stop] = arrival_via_transfer
             best_cost[to_stop] = transfer_cost
+            best_transfers[to_stop] = transfer_count
             best_walk_seconds[to_stop] = next_walk
             pred_stop[to_stop] = start_stop_id
             pred_trip[to_stop] = -2
@@ -177,6 +189,7 @@ def run_raptor_with_stats(
             current_trip_idx = -1
             current_board_time = inf
             current_board_cost = inf
+            current_board_transfer_count = inf_transfers
             current_board_walk_seconds = inf
             for s_idx in range(r_end - r_start):
                 stop_id = route_stops[r_start + s_idx]
@@ -190,6 +203,7 @@ def run_raptor_with_stats(
                     candidate_trip_idx = -1
                     candidate_arrival = inf
                     candidate_board_cost = inf
+                    candidate_board_transfer_count = inf_transfers
                     candidate_board_walk_seconds = inf
                     search_cursor = board_offset
                     if route_board_monotonic[r_start + s_idx] != 0:
@@ -212,9 +226,15 @@ def run_raptor_with_stats(
                                 trip_factor = trip_cost_factors[trip_id_for_candidate]
                             wait_time = value - board_ready_time
                             board_cost = best_cost[stop_id] + np.int64(wait_time) * cost_scale
+                            board_transfer_count = best_transfers[stop_id]
                             board_walk_seconds = best_walk_seconds[stop_id]
                             if _round > 0:
                                 board_cost += transfer_penalty_cost
+                                board_transfer_count += np.int64(1)
+                            if board_transfer_count > max_allowed_transfers:
+                                search_cursor += 1
+                                scanned += 1
+                                continue
 
                             downstream_idx = s_idx + 1
                             if downstream_idx >= (r_end - r_start):
@@ -237,10 +257,15 @@ def run_raptor_with_stats(
                                     chosen_preview = 0
                                 best_candidate_score = candidate_board_cost + np.int64(chosen_preview) * np.int64(chosen_factor)
 
-                            if candidate_trip_idx == -1 or candidate_score < best_candidate_score:
+                            if board_transfer_count < candidate_board_transfer_count or (
+                                board_transfer_count == candidate_board_transfer_count and (
+                                    candidate_trip_idx == -1 or candidate_score < best_candidate_score
+                                )
+                            ):
                                 candidate_trip_idx = trip_idx
                                 candidate_arrival = value
                                 candidate_board_cost = board_cost
+                                candidate_board_transfer_count = board_transfer_count
                                 candidate_board_walk_seconds = board_walk_seconds
 
                         search_cursor += 1
@@ -251,6 +276,7 @@ def run_raptor_with_stats(
                             current_trip_idx = candidate_trip_idx
                             current_board_time = candidate_arrival
                             current_board_cost = candidate_board_cost
+                            current_board_transfer_count = candidate_board_transfer_count
                             current_board_walk_seconds = candidate_board_walk_seconds
                         else:
                             current_trip_id = route_trips[current_trip_idx]
@@ -270,10 +296,13 @@ def run_raptor_with_stats(
                             candidate_in_vehicle = 0
                             candidate_score = candidate_board_cost + np.int64(candidate_in_vehicle) * np.int64(candidate_trip_factor)
 
-                            if candidate_score < current_score:
+                            if candidate_board_transfer_count < current_board_transfer_count or (
+                                candidate_board_transfer_count == current_board_transfer_count and candidate_score < current_score
+                            ):
                                 current_trip_idx = candidate_trip_idx
                                 current_board_time = candidate_arrival
                                 current_board_cost = candidate_board_cost
+                                current_board_transfer_count = candidate_board_transfer_count
                                 current_board_walk_seconds = candidate_board_walk_seconds
 
                 if current_trip_idx == -1:
@@ -290,18 +319,25 @@ def run_raptor_with_stats(
                 if in_vehicle_time < 0:
                     in_vehicle_time = 0
                 arrival_cost = current_board_cost + np.int64(in_vehicle_time) * np.int64(trip_factor)
+                arrival_transfer_count = current_board_transfer_count
                 arrival_walk_seconds = current_board_walk_seconds
 
-                should_update = arrival_cost < best_cost[stop_id] or (
-                    arrival_cost == best_cost[stop_id] and (
-                        arrival_walk_seconds < best_walk_seconds[stop_id]
-                        or (arrival_walk_seconds == best_walk_seconds[stop_id] and arrival_time < earliest[stop_id])
+                should_update = arrival_transfer_count < best_transfers[stop_id] or (
+                    arrival_transfer_count == best_transfers[stop_id] and (
+                        arrival_cost < best_cost[stop_id]
+                        or (
+                            arrival_cost == best_cost[stop_id] and (
+                                arrival_walk_seconds < best_walk_seconds[stop_id]
+                                or (arrival_walk_seconds == best_walk_seconds[stop_id] and arrival_time < earliest[stop_id])
+                            )
+                        )
                     )
                 )
 
                 if should_update:
                     earliest[stop_id] = arrival_time
                     best_cost[stop_id] = arrival_cost
+                    best_transfers[stop_id] = arrival_transfer_count
                     best_walk_seconds[stop_id] = arrival_walk_seconds
                     pred_stop[stop_id] = route_stops[r_start + s_idx - 1] if s_idx > 0 else stop_id
                     pred_trip[stop_id] = trip_id
@@ -340,15 +376,22 @@ def run_raptor_with_stats(
                     + weighted_walk_time * cost_scale
                     + transfer_walk_penalty_cost
                 )
-                should_update = transfer_cost < best_cost[to_stop] or (
-                    transfer_cost == best_cost[to_stop] and (
-                        next_walk_seconds < best_walk_seconds[to_stop]
-                        or (next_walk_seconds == best_walk_seconds[to_stop] and arrival_via_transfer < earliest[to_stop])
+                transfer_count = best_transfers[from_stop]
+                should_update = transfer_count < best_transfers[to_stop] or (
+                    transfer_count == best_transfers[to_stop] and (
+                        transfer_cost < best_cost[to_stop]
+                        or (
+                            transfer_cost == best_cost[to_stop] and (
+                                next_walk_seconds < best_walk_seconds[to_stop]
+                                or (next_walk_seconds == best_walk_seconds[to_stop] and arrival_via_transfer < earliest[to_stop])
+                            )
+                        )
                     )
                 )
                 if should_update:
                     earliest[to_stop] = arrival_via_transfer
                     best_cost[to_stop] = transfer_cost
+                    best_transfers[to_stop] = transfer_count
                     best_walk_seconds[to_stop] = next_walk_seconds
                     pred_stop[to_stop] = from_stop
                     pred_trip[to_stop] = -2
@@ -403,6 +446,7 @@ def run_raptor(
     end_stop_id: int,
     departure_time: int,
     max_rounds: int = 6,
+    max_transfers: int = 4,
 ):
     earliest, pred_stop, pred_trip, pred_time, _, _, _ = run_raptor_with_stats(
         stop_times,
@@ -425,6 +469,7 @@ def run_raptor(
         end_stop_id,
         departure_time,
         max_rounds,
+        max_transfers,
     )
     return earliest, pred_stop, pred_trip, pred_time
 
