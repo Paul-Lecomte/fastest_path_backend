@@ -20,6 +20,29 @@ logger = logging.getLogger("pathfinding.server")
 SUPPORTED_ALGORITHMS = {"raptor", "dijkstra", "astar"}
 RAPTOR_ROUND_BUDGETS = (8, 16, 32, 64)
 DEFAULT_RAPTOR_TRANSFER_PENALTY_SECONDS = 900
+DEFAULT_RAPTOR_MAX_TRANSFERS = 4
+
+
+def _count_transfers(segments) -> int:
+    if not segments:
+        return 0
+    transfers = 0
+    current_trip = None
+    for trip_id, _, _ in segments:
+        if int(trip_id) >= 0:
+            current_trip = int(trip_id)
+            break
+    if current_trip is None:
+        return 0
+
+    for trip_id, _, _ in segments[1:]:
+        trip_value = int(trip_id)
+        if trip_value < 0:
+            continue
+        if trip_value != current_trip:
+            transfers += 1
+            current_trip = trip_value
+    return transfers
 
 
 def _algorithm_sequence(primary: str) -> tuple[str, ...]:
@@ -54,6 +77,7 @@ def _compute_segments(network, algorithm: str, start_stop_id: int, end_stop_id: 
                 end_stop_id,
                 departure_time,
                 max_rounds=max_rounds,
+                max_transfers=DEFAULT_RAPTOR_MAX_TRANSFERS,
             )
 
             segments = build_path(
@@ -156,11 +180,18 @@ async def _find_fastest_segments_parallel(network, algorithm: str, start_stop_id
 
     best_segments = []
     best_arrival = None
+    best_transfers = None
     for segments in results:
         if not segments:
             continue
+        transfer_count = _count_transfers(segments)
         arrival_time = int(segments[-1][2])
-        if best_arrival is None or arrival_time < best_arrival:
+        if (
+            best_transfers is None
+            or transfer_count < best_transfers
+            or (transfer_count == best_transfers and (best_arrival is None or arrival_time < best_arrival))
+        ):
+            best_transfers = transfer_count
             best_arrival = arrival_time
             best_segments = segments
     return best_segments
