@@ -50,8 +50,8 @@ DEFAULT_OPTION_COUNT = 3
 DEFAULT_NEXT_OPTION_SEARCH_WINDOW_MINUTES = 90
 DEFAULT_NEXT_OPTION_STEP_SECONDS = 300
 DEFAULT_NEXT_OPTION_MAX_STEP_SECONDS = 1800
-DEFAULT_NEXT_OPTION_MAX_EVALS = 10
-DEFAULT_NEXT_OPTION_MAX_WALL_SECONDS = 8.0
+DEFAULT_NEXT_OPTION_MAX_EVALS = 24
+DEFAULT_NEXT_OPTION_MAX_WALL_SECONDS = 20.0
 DEFAULT_START_EXPANSION_HOPS = 2
 DEFAULT_START_EXPANSION_MAX_STOPS = 256
 DEFAULT_ORIGIN_RADIUS_M = 1000.0
@@ -334,6 +334,17 @@ def _choose_better_candidate(current: dict[str, Any] | None, candidate: dict[str
     if _is_no_transfer_preferred(current, candidate):
         return current
 
+    # Lexicographic preference for user comfort: fewer transfers first.
+    candidate_transfers = int(candidate.get("transfers", 2**62 - 1))
+    current_transfers = int(current.get("transfers", 2**62 - 1))
+    if candidate_transfers != current_transfers:
+        return candidate if candidate_transfers < current_transfers else current
+
+    candidate_arrival = int(candidate.get("arrival_time", 2**62 - 1))
+    current_arrival = int(current.get("arrival_time", 2**62 - 1))
+    if candidate_arrival != current_arrival:
+        return candidate if candidate_arrival < current_arrival else current
+
     candidate_walk_segments = int(candidate.get("walk_segment_count", 2**62 - 1))
     current_walk_segments = int(current.get("walk_segment_count", 2**62 - 1))
     if candidate_walk_segments != current_walk_segments:
@@ -343,16 +354,6 @@ def _choose_better_candidate(current: dict[str, Any] | None, candidate: dict[str
     current_score = int(current.get("score", 2**62 - 1))
     if candidate_score != current_score:
         return candidate if candidate_score < current_score else current
-
-    candidate_arrival = int(candidate.get("arrival_time", 2**62 - 1))
-    current_arrival = int(current.get("arrival_time", 2**62 - 1))
-    if candidate_arrival != current_arrival:
-        return candidate if candidate_arrival < current_arrival else current
-
-    candidate_transfers = int(candidate.get("transfers", 2**62 - 1))
-    current_transfers = int(current.get("transfers", 2**62 - 1))
-    if candidate_transfers != current_transfers:
-        return candidate if candidate_transfers < current_transfers else current
 
     candidate_egress = int(candidate.get("egress_walk_seconds", 2**62 - 1))
     current_egress = int(current.get("egress_walk_seconds", 2**62 - 1))
@@ -1655,6 +1656,7 @@ def _compute_segments(
                 end_idx,
                 departure_time,
                 max_rounds=max_rounds,
+                max_transfers=DEFAULT_MAX_TRANSFERS,
             )
             segments = build_path(
                 network.stop_times,
@@ -1922,6 +1924,7 @@ def _find_best_segments_for_od_candidates_raptor(
                 -1,
                 departure_time,
                 max_rounds=max_rounds,
+                max_transfers=max_transfers,
             )
 
             best_end = None
@@ -2393,6 +2396,39 @@ def _build_option_response(
                                         int(relaxed_max_transfers),
                                     )
 
+            # General fallback: if strict transfer cap finds no route, relax the cap once.
+            # This avoids intermittent no-path outcomes for normal (non long-distance) requests.
+            if not segments:
+                relaxed_max_transfers = min(
+                    int(DEFAULT_LONG_DISTANCE_RESCUE_MAX_TRANSFERS),
+                    int(max_transfers) + 2,
+                )
+                if relaxed_max_transfers > int(max_transfers):
+                    segments, best_start, best_end, _, relaxed_diagnostics = _find_best_segments_for_od_candidates(
+                        network,
+                        selected_algorithm,
+                        start_indices,
+                        end_indices,
+                        departure_time,
+                        start_penalties,
+                        end_penalties,
+                        int(relaxed_max_transfers),
+                    )
+                    raptor_diagnostics = _merge_raptor_diagnostics(raptor_diagnostics, relaxed_diagnostics)
+                    if segments and not _segments_follow_station_backbone(
+                        network,
+                        segments,
+                        station_whitelist,
+                        max_off_path_stations=backbone_max_offpath,
+                    ):
+                        segments = []
+                    if segments:
+                        logger.info(
+                            "RAPTOR relaxed-transfer fallback hit max_transfers=%s->%s",
+                            int(max_transfers),
+                            int(relaxed_max_transfers),
+                        )
+
             if raptor_diagnostics is not None:
                 start_counts, end_counts = _collect_candidate_counts(raptor_diagnostics)
                 raptor_diagnostics["attempted_start_candidates"] = sorted(start_counts)
@@ -2459,6 +2495,9 @@ def build_multi_departure_response(
     destination_anchor = metadata.get("destination") if isinstance(metadata, dict) else None
 
     options: list[dict[str, Any]] = []
+    next_option_search_status = "not_requested"
+    next_option_search_elapsed_seconds = 0.0
+    next_option_search_evals = 0
 
     requested_option_count = max(1, int(option_count))
     eval_budget = max(0, int(next_option_max_evals))
@@ -2503,6 +2542,7 @@ def build_multi_departure_response(
                     max_transfers,
                 )
     else:
+        next_option_search_status = "completed"
         current_departure = int(departure_time)
         next_option_started = time.perf_counter()
         next_option_evals = 0
@@ -2563,19 +2603,26 @@ def build_multi_departure_response(
 
             if not found_next:
                 if next_option_evals >= eval_budget:
+                    next_option_search_status = "evaluation_budget"
                     logger.info(
                         "Dynamic next-option search stopped by evaluation budget evals=%s options=%s",
                         next_option_evals,
                         len(options),
                     )
                 elif (time.perf_counter() - next_option_started) >= wall_budget_s:
+                    next_option_search_status = "wall_time_budget"
                     logger.info(
                         "Dynamic next-option search stopped by wall-time budget elapsed=%.2fs options=%s evals=%s",
                         (time.perf_counter() - next_option_started),
                         len(options),
                         next_option_evals,
                     )
+                else:
+                    next_option_search_status = "search_window_exhausted"
                 break
+
+        next_option_search_elapsed_seconds = max(0.0, float(time.perf_counter() - next_option_started))
+        next_option_search_evals = int(next_option_evals)
 
     base = options[0] if options else {
         "departure_time": int(departure_time),
@@ -2593,6 +2640,9 @@ def build_multi_departure_response(
         **(metadata or {}),
         "resolver_algorithm": base.get("resolver_algorithm", algorithm),
         "fallback_used": bool(base.get("fallback_used", False)),
+        "next_option_search_status": next_option_search_status,
+        "next_option_search_elapsed_seconds": round(float(next_option_search_elapsed_seconds), 3),
+        "next_option_search_evals": int(next_option_search_evals),
         "transfers": base.get("transfers"),
         "duration_seconds": base.get("duration_seconds"),
         "start_stop_id": base.get("start_stop_id"),
