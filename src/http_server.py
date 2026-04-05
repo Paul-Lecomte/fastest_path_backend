@@ -6,6 +6,8 @@ import logging
 import time
 import heapq
 import math
+import difflib
+import re
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -67,6 +69,8 @@ DEFAULT_ADAPTIVE_EXPANSION_MAX_TIERS = 4
 DEFAULT_RAPTOR_TRANSFER_PENALTY_SECONDS = 3600
 DEFAULT_OPTION_TRANSFER_PENALTY_SECONDS = 3600
 DEFAULT_MAX_TRANSFERS = 4
+DEFAULT_RAPTOR_BOARD_SCAN_LIMIT = 6
+DEFAULT_RAPTOR_RESCUE_BOARD_SCAN_LIMIT = 18
 DEFAULT_ACCESS_WALK_SCORE_CAP_SECONDS = 900
 DEFAULT_EGRESS_WALK_SCORE_CAP_SECONDS = 900
 DEFAULT_WALK_SCORE_WEIGHT_NUM = 1
@@ -81,6 +85,117 @@ DEFAULT_LONG_DISTANCE_RESCUE_STOPS_PER_HUB = 6
 DEFAULT_LONG_DISTANCE_RESCUE_EXTRA_TRANSFERS = 3
 DEFAULT_LONG_DISTANCE_RESCUE_MAX_TRANSFERS = 8
 DEFAULT_LONG_DISTANCE_BACKBONE_MAX_OFFPATH = 12
+DEFAULT_GENERAL_RESCUE_MAX_CANDIDATES = 36
+
+
+def _normalize_stop_text(value: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", " ", value.lower())
+    return " ".join(part for part in normalized.split(" ") if part)
+
+
+def _build_stop_lookup_cache(network: TransitNetwork) -> dict[str, Any]:
+    cached = getattr(network, "_stop_lookup_cache", None)
+    if isinstance(cached, dict):
+        return cached
+
+    id_exact: dict[str, int] = {}
+    normalized_labels: list[tuple[str, int, str]] = []
+    exact_norm_index: dict[str, int] = {}
+
+    for stop_idx, stop_id in enumerate(network.stop_ids):
+        stop_text = str(stop_id)
+        id_exact[stop_text.lower()] = int(stop_idx)
+        norm = _normalize_stop_text(stop_text)
+        if norm:
+            normalized_labels.append((norm, int(stop_idx), stop_text))
+            if norm not in exact_norm_index:
+                exact_norm_index[norm] = int(stop_idx)
+
+    stop_names = getattr(network, "stop_names", None)
+    if isinstance(stop_names, (list, np.ndarray)):
+        for stop_idx in range(min(len(stop_names), len(network.stop_ids))):
+            name = stop_names[stop_idx]
+            if name is None:
+                continue
+            name_text = str(name)
+            norm = _normalize_stop_text(name_text)
+            if not norm:
+                continue
+            normalized_labels.append((norm, int(stop_idx), name_text))
+            if norm not in exact_norm_index:
+                exact_norm_index[norm] = int(stop_idx)
+
+    cache = {
+        "id_exact": id_exact,
+        "normalized_labels": normalized_labels,
+        "exact_norm_index": exact_norm_index,
+    }
+    setattr(network, "_stop_lookup_cache", cache)
+    return cache
+
+
+def _resolve_stop_query_to_index(network: TransitNetwork, query: str) -> tuple[int | None, dict[str, Any] | None]:
+    raw = str(query).strip()
+    if not raw:
+        return None, None
+
+    direct = network.stop_id_index.get(raw)
+    if direct is not None:
+        return int(direct), {"match_type": "exact_stop_id", "query": raw, "matched": raw}
+
+    cache = _build_stop_lookup_cache(network)
+    id_exact = cache["id_exact"]
+    lower = raw.lower()
+    if lower in id_exact:
+        idx = int(id_exact[lower])
+        return idx, {"match_type": "casefold_stop_id", "query": raw, "matched": network.stop_ids[idx]}
+
+    norm_query = _normalize_stop_text(raw)
+    if not norm_query:
+        return None, None
+
+    exact_norm_index = cache["exact_norm_index"]
+    if norm_query in exact_norm_index:
+        idx = int(exact_norm_index[norm_query])
+        return idx, {"match_type": "normalized_exact", "query": raw, "matched": network.stop_ids[idx]}
+
+    query_tokens = norm_query.split(" ")
+    candidates: list[tuple[float, int, str]] = []
+    for candidate_norm, stop_idx, candidate_label in cache["normalized_labels"]:
+        if norm_query in candidate_norm:
+            score = 0.97
+        else:
+            candidate_tokens = candidate_norm.split(" ")
+            all_tokens_match = True
+            for token in query_tokens:
+                if not any(part.startswith(token) for part in candidate_tokens):
+                    all_tokens_match = False
+                    break
+            if all_tokens_match:
+                score = 0.95
+            else:
+                score = float(difflib.SequenceMatcher(None, norm_query, candidate_norm).ratio())
+                if score < 0.80:
+                    continue
+        candidates.append((score, int(stop_idx), str(candidate_label)))
+
+    if not candidates:
+        return None, None
+
+    candidates.sort(key=lambda item: (item[0], -len(item[2])), reverse=True)
+    best_score, best_idx, best_label = candidates[0]
+    second_score = candidates[1][0] if len(candidates) > 1 else -1.0
+    if best_score < 0.86:
+        return None, None
+    if second_score >= 0.86 and (best_score - second_score) < 0.02 and int(candidates[1][1]) != int(best_idx):
+        return None, None
+
+    return int(best_idx), {
+        "match_type": "fuzzy",
+        "query": raw,
+        "matched": best_label,
+        "confidence": round(float(best_score), 4),
+    }
 
 
 def _snapshot_indices(values: list[int], limit: int = 64) -> list[int]:
@@ -1426,6 +1541,24 @@ def _penalties_for_anchor(
     return penalties
 
 
+def _rescue_nearest_candidates(
+    network: TransitNetwork,
+    anchor: dict[str, Any] | None,
+    target_count: int,
+) -> list[int]:
+    if not isinstance(anchor, dict):
+        return []
+    lat = _to_float(anchor.get("lat"))
+    lon = _to_float(anchor.get("lon"))
+    if lat is None or lon is None:
+        return []
+    sorted_indices, _ = _sorted_stops_by_distance(network, float(lat), float(lon))
+    if sorted_indices.size == 0:
+        return []
+    count = max(1, min(int(target_count), int(sorted_indices.size)))
+    return [int(value) for value in sorted_indices[:count].tolist()]
+
+
 def load_network() -> TransitNetwork:
     from .config import get_neo4j_config, get_network_cache_config
     from .loader import load_network_from_cache, save_network_to_cache
@@ -1621,7 +1754,11 @@ def _raptor_round_budgets(network: TransitNetwork) -> tuple[int, ...]:
 
 
 def _algorithm_sequence(primary: str) -> tuple[str, ...]:
-    return (primary,)
+    if primary == "raptor":
+        return ("raptor", "astar", "dijkstra")
+    if primary == "astar":
+        return ("astar", "dijkstra")
+    return ("dijkstra",)
 
 
 def _compute_segments(
@@ -1657,6 +1794,7 @@ def _compute_segments(
                 departure_time,
                 max_rounds=max_rounds,
                 max_transfers=DEFAULT_MAX_TRANSFERS,
+                board_scan_limit=DEFAULT_RAPTOR_BOARD_SCAN_LIMIT,
             )
             segments = build_path(
                 network.stop_times,
@@ -1892,6 +2030,7 @@ def _find_best_segments_for_od_candidates_raptor(
     start_penalties: dict[int, int] | None = None,
     end_penalties: dict[int, int] | None = None,
     max_transfers: int = DEFAULT_MAX_TRANSFERS,
+    board_scan_limit: int = DEFAULT_RAPTOR_BOARD_SCAN_LIMIT,
 ):
     budget_caps = list(_raptor_round_budgets(network))
     inf = int(2**62)
@@ -1925,6 +2064,7 @@ def _find_best_segments_for_od_candidates_raptor(
                 departure_time,
                 max_rounds=max_rounds,
                 max_transfers=max_transfers,
+                board_scan_limit=board_scan_limit,
             )
 
             best_end = None
@@ -2109,6 +2249,7 @@ def _find_best_segments_for_od_candidates(
     start_penalties: dict[int, int] | None = None,
     end_penalties: dict[int, int] | None = None,
     max_transfers: int = DEFAULT_MAX_TRANSFERS,
+    board_scan_limit: int = DEFAULT_RAPTOR_BOARD_SCAN_LIMIT,
 ):
     if algorithm == "raptor":
         return _find_best_segments_for_od_candidates_raptor(
@@ -2119,6 +2260,7 @@ def _find_best_segments_for_od_candidates(
             start_penalties,
             end_penalties,
             max_transfers,
+            board_scan_limit,
         )
 
     best_segments = []
@@ -2213,6 +2355,7 @@ def _build_option_response(
     best_end = None
     resolved_algorithm = algorithm
     raptor_diagnostics = None
+    raptor_board_scan_limit = int(DEFAULT_RAPTOR_BOARD_SCAN_LIMIT)
     for selected_algorithm in algorithms:
         segments, best_start, best_end, _, diagnostics = _find_best_segments_for_od_candidates(
             network,
@@ -2223,6 +2366,7 @@ def _build_option_response(
             start_penalties,
             end_penalties,
             max_transfers,
+            raptor_board_scan_limit,
         )
         if segments and algorithm == "raptor":
             if not _segments_follow_station_backbone(
@@ -2255,6 +2399,7 @@ def _build_option_response(
                         start_penalties,
                         end_penalties,
                         max_transfers,
+                        raptor_board_scan_limit,
                     )
                     raptor_diagnostics = _merge_raptor_diagnostics(raptor_diagnostics, tier_diagnostics)
                     if segments and not _segments_follow_station_backbone(
@@ -2289,6 +2434,7 @@ def _build_option_response(
                         start_penalties,
                         end_penalties,
                         max_transfers,
+                        raptor_board_scan_limit,
                     )
                     raptor_diagnostics = _merge_raptor_diagnostics(raptor_diagnostics, tier_diagnostics)
                     if segments and not _segments_follow_station_backbone(
@@ -2343,6 +2489,7 @@ def _build_option_response(
                             rescue_start_penalties,
                             rescue_end_penalties,
                             max_transfers,
+                            raptor_board_scan_limit,
                         )
                         raptor_diagnostics = _merge_raptor_diagnostics(raptor_diagnostics, rescue_diagnostics)
                         if segments and not _segments_follow_station_backbone(
@@ -2377,6 +2524,7 @@ def _build_option_response(
                                     rescue_start_penalties,
                                     rescue_end_penalties,
                                     int(relaxed_max_transfers),
+                                    raptor_board_scan_limit,
                                 )
                                 raptor_diagnostics = _merge_raptor_diagnostics(raptor_diagnostics, relaxed_diagnostics)
                                 if segments and not _segments_follow_station_backbone(
@@ -2413,6 +2561,7 @@ def _build_option_response(
                         start_penalties,
                         end_penalties,
                         int(relaxed_max_transfers),
+                        raptor_board_scan_limit,
                     )
                     raptor_diagnostics = _merge_raptor_diagnostics(raptor_diagnostics, relaxed_diagnostics)
                     if segments and not _segments_follow_station_backbone(
@@ -2429,6 +2578,40 @@ def _build_option_response(
                             int(relaxed_max_transfers),
                         )
 
+            # Final RAPTOR rescue: widen candidate boarding scan only when strict passes fail.
+            if not segments:
+                rescue_scan_limit = max(
+                    int(DEFAULT_RAPTOR_RESCUE_BOARD_SCAN_LIMIT),
+                    int(raptor_board_scan_limit),
+                )
+                if rescue_scan_limit > int(raptor_board_scan_limit):
+                    segments, best_start, best_end, _, rescue_scan_diagnostics = _find_best_segments_for_od_candidates(
+                        network,
+                        selected_algorithm,
+                        start_indices,
+                        end_indices,
+                        departure_time,
+                        start_penalties,
+                        end_penalties,
+                        int(max_transfers),
+                        int(rescue_scan_limit),
+                    )
+                    raptor_diagnostics = _merge_raptor_diagnostics(raptor_diagnostics, rescue_scan_diagnostics)
+                    if segments and not _segments_follow_station_backbone(
+                        network,
+                        segments,
+                        station_whitelist,
+                        max_off_path_stations=backbone_max_offpath,
+                    ):
+                        segments = []
+                    if segments:
+                        raptor_board_scan_limit = int(rescue_scan_limit)
+                        logger.info(
+                            "RAPTOR rescue scan fallback hit board_scan_limit=%s->%s",
+                            int(DEFAULT_RAPTOR_BOARD_SCAN_LIMIT),
+                            int(rescue_scan_limit),
+                        )
+
             if raptor_diagnostics is not None:
                 start_counts, end_counts = _collect_candidate_counts(raptor_diagnostics)
                 raptor_diagnostics["attempted_start_candidates"] = sorted(start_counts)
@@ -2441,6 +2624,106 @@ def _build_option_response(
                         start_counts,
                         end_counts,
                     )
+                raptor_diagnostics["board_scan_limit"] = int(raptor_board_scan_limit)
+
+        if selected_algorithm != "raptor":
+            if not segments:
+                destination_tiers = _expand_candidates_tiered(
+                    network,
+                    end_indices,
+                    destination_anchor,
+                    "destination",
+                )
+                for tier_idx, tier_end_indices in enumerate(destination_tiers[1:], start=1):
+                    segments, best_start, best_end, _, _ = _find_best_segments_for_od_candidates(
+                        network,
+                        selected_algorithm,
+                        start_indices,
+                        tier_end_indices,
+                        departure_time,
+                        start_penalties,
+                        end_penalties,
+                        max_transfers,
+                    )
+                    if segments:
+                        logger.info(
+                            "%s adaptive destination expansion hit tier=%s end_candidates=%s",
+                            selected_algorithm.upper(),
+                            tier_idx,
+                            len(tier_end_indices),
+                        )
+                        break
+
+            if not segments:
+                origin_tiers = _expand_candidates_tiered(
+                    network,
+                    start_indices,
+                    origin_anchor,
+                    "origin",
+                )
+                for tier_idx, tier_start_indices in enumerate(origin_tiers[1:], start=1):
+                    segments, best_start, best_end, _, _ = _find_best_segments_for_od_candidates(
+                        network,
+                        selected_algorithm,
+                        tier_start_indices,
+                        end_indices,
+                        departure_time,
+                        start_penalties,
+                        end_penalties,
+                        max_transfers,
+                    )
+                    if segments:
+                        logger.info(
+                            "%s adaptive origin expansion hit tier=%s start_candidates=%s",
+                            selected_algorithm.upper(),
+                            tier_idx,
+                            len(tier_start_indices),
+                        )
+                        break
+
+        # Final generic rescue for all algorithms: widen nearest OD candidate pools.
+        if not segments and (isinstance(origin_anchor, dict) or isinstance(destination_anchor, dict)):
+            rescue_start_target = max(int(DEFAULT_GENERAL_RESCUE_MAX_CANDIDATES), len(start_indices))
+            rescue_end_target = max(int(DEFAULT_GENERAL_RESCUE_MAX_CANDIDATES), len(end_indices))
+            rescue_start_indices = _rescue_nearest_candidates(network, origin_anchor, rescue_start_target) or list(start_indices)
+            rescue_end_indices = _rescue_nearest_candidates(network, destination_anchor, rescue_end_target) or list(end_indices)
+
+            rescue_start_penalties = dict(start_penalties or {})
+            rescue_start_penalties.update(_penalties_for_anchor(network, rescue_start_indices, origin_anchor))
+            rescue_end_penalties = dict(end_penalties or {})
+            rescue_end_penalties.update(_penalties_for_anchor(network, rescue_end_indices, destination_anchor))
+
+            rescue_max_transfers = int(max_transfers)
+            if selected_algorithm == "raptor":
+                rescue_max_transfers = min(
+                    int(DEFAULT_LONG_DISTANCE_RESCUE_MAX_TRANSFERS),
+                    int(max_transfers) + int(DEFAULT_LONG_DISTANCE_RESCUE_EXTRA_TRANSFERS),
+                )
+
+            segments, best_start, best_end, _, rescue_diagnostics = _find_best_segments_for_od_candidates(
+                network,
+                selected_algorithm,
+                rescue_start_indices,
+                rescue_end_indices,
+                departure_time,
+                rescue_start_penalties,
+                rescue_end_penalties,
+                rescue_max_transfers,
+                raptor_board_scan_limit,
+            )
+
+            if selected_algorithm == "raptor":
+                raptor_diagnostics = _merge_raptor_diagnostics(raptor_diagnostics, rescue_diagnostics)
+
+            if segments:
+                start_penalties = rescue_start_penalties
+                end_penalties = rescue_end_penalties
+                logger.info(
+                    "%s final candidate rescue hit start_candidates=%s end_candidates=%s",
+                    selected_algorithm.upper(),
+                    len(rescue_start_indices),
+                    len(rescue_end_indices),
+                )
 
         if segments:
             resolved_algorithm = selected_algorithm
@@ -2763,6 +3046,7 @@ class PathRequestHandler(BaseHTTPRequestHandler):
             return
 
         metadata = None
+        resolved_stop_queries: list[dict[str, Any]] = []
         start_penalties = None
         end_penalties = None
         if origin is not None:
@@ -2776,11 +3060,18 @@ class PathRequestHandler(BaseHTTPRequestHandler):
         else:
             start_indices = []
             for stop_id in normalized_start_stop_ids:
-                stop_index = self.network.stop_id_index.get(stop_id)
+                stop_index, resolution = _resolve_stop_query_to_index(self.network, stop_id)
                 if stop_index is None:
                     self._send_json(404, {"error": "unknown_stop_id"})
                     return
                 start_indices.append(stop_index)
+                if resolution is not None and resolution.get("match_type") != "exact_stop_id":
+                    resolved_stop_queries.append(
+                        {
+                            "field": "start_stop_id",
+                            **resolution,
+                        }
+                    )
 
             start_indices = list(dict.fromkeys(start_indices))
 
@@ -2793,11 +3084,18 @@ class PathRequestHandler(BaseHTTPRequestHandler):
             if isinstance(destination_result, dict):
                 metadata = {**(metadata or {}), **destination_result}
         else:
-            resolved_end_idx = self.network.stop_id_index.get(end_stop_id)
+            resolved_end_idx, resolution = _resolve_stop_query_to_index(self.network, end_stop_id)
             if resolved_end_idx is None:
                 self._send_json(404, {"error": "unknown_stop_id"})
                 return
             end_indices = [resolved_end_idx]
+            if resolution is not None and resolution.get("match_type") != "exact_stop_id":
+                resolved_stop_queries.append(
+                    {
+                        "field": "end_stop_id",
+                        **resolution,
+                    }
+                )
 
         if algorithm not in {"raptor", "dijkstra", "astar"}:
             self._send_json(400, {"error": "unsupported_algorithm"})
@@ -2834,6 +3132,8 @@ class PathRequestHandler(BaseHTTPRequestHandler):
             next_option_max_evals=next_option_max_evals,
             next_option_max_wall_seconds=next_option_max_wall_seconds,
         )
+        if resolved_stop_queries:
+            response["resolved_stop_queries"] = resolved_stop_queries
         logger.info(
             "HTTP /path algorithm=%s starts=%s ends=%s departure=%s options=%s",
             algorithm,
