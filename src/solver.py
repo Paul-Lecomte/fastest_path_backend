@@ -58,6 +58,7 @@ def run_raptor_with_stats(
     departure_time: int,
     max_rounds: int = 6,
     max_transfers: int = 4,
+    board_scan_limit: int = 6,
 ):
     n_stops = stop_route_offsets.shape[0] - 1
     n_routes = route_stop_offsets.shape[0] - 1
@@ -76,6 +77,7 @@ def run_raptor_with_stats(
     transfer_walk_penalty_cost = transfer_penalty_cost
     transfer_board_buffer_seconds = np.int64(min(10, max(0, int(transfer_penalty_seconds)) // 60))
     max_allowed_transfers = np.int64(max(0, int(max_transfers)))
+    scan_limit = np.int64(max(1, int(board_scan_limit)))
     inf_transfers = np.int64(2**30)
     earliest = np.full(n_stops, inf, dtype=np.int64)
     best_cost = np.full(n_stops, inf, dtype=np.int64)
@@ -214,9 +216,8 @@ def run_raptor_with_stats(
                             board_ready_time,
                         )
 
-                    candidate_scan_limit = 6
                     scanned = 0
-                    while search_cursor < board_end and (route_board_monotonic[r_start + s_idx] == 0 or scanned < candidate_scan_limit):
+                    while search_cursor < board_end and (route_board_monotonic[r_start + s_idx] == 0 or scanned < scan_limit):
                         value = route_board_times[search_cursor]
                         if value >= board_ready_time:
                             trip_idx = t_start + (search_cursor - board_offset)
@@ -447,6 +448,7 @@ def run_raptor(
     departure_time: int,
     max_rounds: int = 6,
     max_transfers: int = 4,
+    board_scan_limit: int = 6,
 ):
     earliest, pred_stop, pred_trip, pred_time, _, _, _ = run_raptor_with_stats(
         stop_times,
@@ -470,6 +472,7 @@ def run_raptor(
         departure_time,
         max_rounds,
         max_transfers,
+        board_scan_limit,
     )
     return earliest, pred_stop, pred_trip, pred_time
 

@@ -23,6 +23,7 @@ from src.http_server import (
     _build_segment_payloads,
     _select_starts_from_origin,
     _select_ends_from_destination,
+    _resolve_stop_query_to_index,
 )
 from src.server import _find_fastest_segments_parallel, _get_start_stop_ids
 
@@ -630,6 +631,36 @@ def test_http_origin_and_destination_route_without_explicit_stop_ids():
 def test_get_start_stop_ids_prefers_repeated_field():
     request = SimpleNamespace(start_stop_id="A", start_stop_ids=[" B ", "A", "", "B"])
     assert _get_start_stop_ids(request) == ["B", "A"]
+
+
+def test_resolve_stop_query_exact_stop_id():
+    network = build_mock_network()
+    idx, meta = _resolve_stop_query_to_index(network, "A")
+
+    assert idx == network.stop_id_index["A"]
+    assert meta is not None
+    assert meta["match_type"] == "exact_stop_id"
+
+
+def test_resolve_stop_query_fuzzy_with_stop_names():
+    network = build_mock_network()
+    network.stop_ids = ["STOP_LAUSANNE", "STOP_OURS", "STOP_ECHALLENS"]
+    network.stop_id_index = {value: idx for idx, value in enumerate(network.stop_ids)}
+    network.stop_names = np.asarray(["Lausanne Gare", "Lausanne Ours", "Echallens Gare"], dtype=object)
+
+    idx, meta = _resolve_stop_query_to_index(network, "lausanne our")
+
+    assert idx == 1
+    assert meta is not None
+    assert meta["match_type"] == "fuzzy"
+
+
+def test_resolve_stop_query_returns_none_for_unknown():
+    network = build_mock_network()
+    idx, meta = _resolve_stop_query_to_index(network, "zzzz impossible stop")
+
+    assert idx is None
+    assert meta is None
 
 
 def test_parallel_multi_start_selects_fastest_path():
