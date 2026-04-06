@@ -281,8 +281,9 @@ python -m pytest -q
 
 - [x] Working RAPTOR implementation with real data from Neo4j
 - [x] Add more detailed logging (e.g., query times, pathfinding times)
-- [ ] Implement returned data for the frontend and a function to fetch trip geometry
-- [ ] Implement more comprehensive error handling (e.g., invalid input, database errors)
+- [x] Implement returned data for the frontend and a function to fetch trip geometry
+- [x] Implement more comprehensive error handling (e.g., invalid input, database errors)
+- [ ] Improve the algo for the walking paths
 ---
 
 ## License
