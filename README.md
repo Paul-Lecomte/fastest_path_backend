@@ -284,6 +284,7 @@ python -m pytest -q
 - [x] Implement returned data for the frontend and a function to fetch trip geometry
 - [x] Implement more comprehensive error handling (e.g., invalid input, database errors)
 - [ ] Improve the algo for the walking paths
+- [ ] Better the search for stops
 ---
 
 ## License
