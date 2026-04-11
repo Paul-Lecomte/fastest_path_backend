@@ -1167,11 +1167,88 @@ def _segment_payload(network: TransitNetwork, trip_id: int, stop_id: int, arriva
     }
 
 
+def _build_anchor_walking_segment_payload(
+    *,
+    from_lat: float,
+    from_lon: float,
+    to_lat: float,
+    to_lon: float,
+    from_stop_id: str,
+    to_stop_id: str,
+    arrival_time: int,
+    walk_duration_seconds: int,
+    segment_type: str,
+) -> dict[str, Any] | None:
+    if not (
+        np.isfinite(float(from_lat))
+        and np.isfinite(float(from_lon))
+        and np.isfinite(float(to_lat))
+        and np.isfinite(float(to_lon))
+    ):
+        return None
+
+    duration = max(0, int(walk_duration_seconds))
+    walking_path = _find_walking_path_via_osrm(
+        float(from_lat),
+        float(from_lon),
+        float(to_lat),
+        float(to_lon),
+        timeout_seconds=DEFAULT_OSRM_TIMEOUT_SECONDS,
+    )
+
+    if walking_path is not None and len(walking_path) > 0:
+        routing_method = "osrm"
+        coordinates = [[float(lon), float(lat)] for lat, lon in walking_path]
+        total_distance_m = 0.0
+        for idx in range(len(walking_path) - 1):
+            lat1, lon1 = walking_path[idx]
+            lat2, lon2 = walking_path[idx + 1]
+            total_distance_m += _haversine_distance_point_m(lat1, lon1, lat2, lon2)
+    else:
+        routing_method = "straight_line"
+        coordinates = [
+            [float(from_lon), float(from_lat)],
+            [float(to_lon), float(to_lat)],
+        ]
+        total_distance_m = _haversine_distance_point_m(
+            float(from_lat),
+            float(from_lon),
+            float(to_lat),
+            float(to_lon),
+        )
+
+    payload: dict[str, Any] = {
+        "trip_id": "TRANSFER",
+        "stop_id": str(to_stop_id),
+        "from_stop_id": str(from_stop_id),
+        "arrival_time": int(arrival_time),
+        "lat": float(to_lat),
+        "lon": float(to_lon),
+        "walk_duration_seconds": int(duration),
+        "walking_segment_type": str(segment_type),
+        "walking_geometry": {
+            "type": "LineString",
+            "coordinates": coordinates,
+        },
+        "walk_distance_m": float(total_distance_m),
+        "routing_method": routing_method,
+    }
+    if duration > 0 and total_distance_m > 0:
+        walk_speed_kmh = (float(total_distance_m) / float(duration)) * 3.6
+        payload["walking_speed_kmh"] = round(float(walk_speed_kmh), 2)
+    return payload
+
+
 def _build_segment_payloads(
     network: TransitNetwork,
     segments,
     start_stop_idx: int | None,
     departure_time: int,
+    end_stop_idx: int | None = None,
+    origin_anchor: dict[str, Any] | None = None,
+    destination_anchor: dict[str, Any] | None = None,
+    access_walk_seconds: int = 0,
+    egress_walk_seconds: int = 0,
 ) -> list[dict[str, Any]]:
     payloads: list[dict[str, Any]] = []
     for idx, (trip_id, stop_id, arrival_time) in enumerate(segments):
@@ -1289,6 +1366,44 @@ def _build_segment_payloads(
 
 
         payloads.append(payload)
+
+    if payloads and start_stop_idx is not None and isinstance(origin_anchor, dict):
+        origin_lat = _to_float(origin_anchor.get("lat"))
+        origin_lon = _to_float(origin_anchor.get("lon"))
+        start_lat, start_lon = _segment_coordinates(network, int(start_stop_idx))
+        if origin_lat is not None and origin_lon is not None and start_lat is not None and start_lon is not None:
+            access_payload = _build_anchor_walking_segment_payload(
+                from_lat=float(origin_lat),
+                from_lon=float(origin_lon),
+                to_lat=float(start_lat),
+                to_lon=float(start_lon),
+                from_stop_id="ORIGIN",
+                to_stop_id=str(network.stop_ids[int(start_stop_idx)]),
+                arrival_time=int(departure_time) + max(0, int(access_walk_seconds)),
+                walk_duration_seconds=max(0, int(access_walk_seconds)),
+                segment_type="access",
+            )
+            if access_payload is not None:
+                payloads = [access_payload, *payloads]
+
+    if payloads and end_stop_idx is not None and isinstance(destination_anchor, dict):
+        destination_lat = _to_float(destination_anchor.get("lat"))
+        destination_lon = _to_float(destination_anchor.get("lon"))
+        end_lat, end_lon = _segment_coordinates(network, int(end_stop_idx))
+        if destination_lat is not None and destination_lon is not None and end_lat is not None and end_lon is not None:
+            egress_payload = _build_anchor_walking_segment_payload(
+                from_lat=float(end_lat),
+                from_lon=float(end_lon),
+                to_lat=float(destination_lat),
+                to_lon=float(destination_lon),
+                from_stop_id=str(network.stop_ids[int(end_stop_idx)]),
+                to_stop_id="DESTINATION",
+                arrival_time=int(segments[-1][2]) + max(0, int(egress_walk_seconds)),
+                walk_duration_seconds=max(0, int(egress_walk_seconds)),
+                segment_type="egress",
+            )
+            if egress_payload is not None:
+                payloads.append(egress_payload)
     return payloads
 
 
@@ -2732,6 +2847,8 @@ def _build_option_response(
     if segments is None:
         return {}
     option_trip_profile = _summarize_option_trip_profile(network, segments)
+    access_walk_seconds = int(start_penalties.get(best_start, 0)) if (best_start is not None and start_penalties) else 0
+    egress_walk_seconds = int(end_penalties.get(best_end, 0)) if (best_end is not None and end_penalties) else 0
     return {
         "departure_time": int(departure_time),
         "resolver_algorithm": resolved_algorithm,
@@ -2740,14 +2857,19 @@ def _build_option_response(
         "max_transfers": int(max_transfers),
         "duration_seconds": int(segments[-1][2] - departure_time) if segments else None,
         "start_stop_id": network.stop_ids[best_start] if best_start is not None else None,
-        "access_walk_seconds": int(start_penalties.get(best_start, 0)) if (best_start is not None and start_penalties) else 0,
+        "access_walk_seconds": access_walk_seconds,
         "end_stop_id": network.stop_ids[best_end] if best_end is not None else None,
-        "egress_walk_seconds": int(end_penalties.get(best_end, 0)) if (best_end is not None and end_penalties) else 0,
+        "egress_walk_seconds": egress_walk_seconds,
         "segments": _build_segment_payloads(
             network,
             segments,
             best_start,
             departure_time,
+            end_stop_idx=best_end,
+            origin_anchor=origin_anchor,
+            destination_anchor=destination_anchor,
+            access_walk_seconds=access_walk_seconds,
+            egress_walk_seconds=egress_walk_seconds,
         ),
         "itinerary_trip_profile": option_trip_profile,
         "raptor_diagnostics": raptor_diagnostics if algorithm == "raptor" else None,
