@@ -121,6 +121,9 @@ attempt metadata and no-path reasons (`no_path_reason`) to help debug difficult
 OD pairs and long-transfer failures.
 
 Segments can include multiple trips when a transfer is required.
+When `origin`/`destination` anchors are provided, the returned `segments` list now
+includes post-solve walking legs for `access` (origin -> selected start stop)
+and `egress` (selected end stop -> destination).
 When `start_stop_ids` is provided, all starts are evaluated and the fastest resulting path is returned.
 When `origin` is provided, nearby stops are selected automatically and scored with walking access time.
 When `destination` is provided, nearby destination stops are selected automatically and scored with walking egress time.
