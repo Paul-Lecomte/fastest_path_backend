@@ -522,8 +522,48 @@ def test_transfer_segment_includes_walking_geometry():
     assert segment["walk_duration_seconds"] == 30
     assert "walking_geometry" in segment
     assert segment["walking_geometry"]["type"] == "LineString"
-    assert len(segment["walking_geometry"]["coordinates"]) == 2
+    assert len(segment["walking_geometry"]["coordinates"]) >= 2
     assert segment["walk_distance_m"] > 0
+
+
+def test_http_origin_destination_includes_access_and_egress_walk_segments(monkeypatch):
+    network = build_mock_network()
+
+    # Keep geometry deterministic for the test by forcing straight-line fallback.
+    monkeypatch.setattr("src.http_server._find_walking_path_via_osrm", lambda *args, **kwargs: None)
+
+    start_indices, start_penalties, origin_metadata = _select_starts_from_origin(
+        network,
+        {"lat": 48.8566, "lon": 2.3522, "radius_m": 1200, "max_candidates": 3},
+    )
+    end_indices, end_penalties, destination_metadata = _select_ends_from_destination(
+        network,
+        {"lat": 48.8574, "lon": 2.3540, "radius_m": 1200, "max_candidates": 3},
+    )
+
+    response = build_multi_departure_response(
+        network,
+        "dijkstra",
+        start_indices,
+        end_indices,
+        900,
+        offset_minutes=(0,),
+        start_penalties=start_penalties,
+        end_penalties=end_penalties,
+        metadata={**origin_metadata, **destination_metadata},
+    )
+
+    assert response["segments"]
+    first_segment = response["segments"][0]
+    last_segment = response["segments"][-1]
+
+    assert first_segment["trip_id"] == "TRANSFER"
+    assert first_segment["walking_segment_type"] == "access"
+    assert first_segment["from_stop_id"] == "ORIGIN"
+
+    assert last_segment["trip_id"] == "TRANSFER"
+    assert last_segment["walking_segment_type"] == "egress"
+    assert last_segment["stop_id"] == "DESTINATION"
 
 
 def test_http_departure_parses_numeric_string_timestamp():
