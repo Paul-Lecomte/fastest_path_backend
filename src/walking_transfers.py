@@ -1,4 +1,5 @@
 """Query-time walking transfer resolution using OSM graph with result caching."""
+# This module provides the OSMWalkingTransfers class which loads a preprocessed OSM walking graph and computes walking transfer times on-demand. It uses a compact CSR adjacency format for efficient shortest path computation and caches results to speed up repeated queries. The class supports finding the nearest OSM node to given coordinates and computing walking times to multiple target locations within a specified maximum walking time.
 from __future__ import annotations
 
 import heapq
