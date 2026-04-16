@@ -227,6 +227,12 @@ py -3.12 -m venv .venv-precompute
 python -m scripts.precompute_walk_transfers --osm-pbf switzerland.osm.pbf --output .cache/walk_transfers_osm.npz
 ```
 
+For large/full precompute runs, prefer the resumable command below (recommended):
+
+```powershell
+.\.venv-precompute\Scripts\python.exe -m scripts.precompute_walk_transfers --osm-pbf .cache/switzerland.osm.pbf --output .cache/walk_transfers_osm.npz --sample-rate 1.0 --bbox-from-stops --bbox-margin-m 5000 --resume --checkpoint-every 200 --keep-checkpoint
+```
+
 3) Start the server normally
 
 If `WALK_TRANSFER_CACHE_ENABLED=true`, the loader will pick up
