@@ -21,7 +21,7 @@ DEFAULT_TRANSFER_FALLBACK_SECONDS = 120
 DEFAULT_TRANSFER_MAX_DISTANCE_M = 250.0
 DEFAULT_TRANSFER_NEARBY_MAX_DISTANCE_M = 120.0
 DEFAULT_TRANSFER_NEARBY_MAX_NEIGHBORS = 4
-DEFAULT_WALK_TIME_MULTIPLIER = 15.0
+DEFAULT_WALK_TIME_MULTIPLIER = 1.0
 DEFAULT_TRANSFER_CACHE_PATH = ".cache/walk_transfers_osm.npz"
 DEFAULT_TRANSFER_CACHE_FALLBACK_PATHS = (
     ".cache/transfer_graph_osrm.npz",
@@ -639,13 +639,6 @@ def load_transfer_graph_from_cache(
         transfer_neighbors = np.asarray(payload["transfer_neighbors"], dtype=np.int32)
         transfer_weights = np.asarray(payload["transfer_weights"], dtype=np.int64)
 
-        walk_time_multiplier = _parse_positive_float_env("WALK_TIME_MULTIPLIER", DEFAULT_WALK_TIME_MULTIPLIER)
-        if abs(walk_time_multiplier - 1.0) > 1e-9:
-            transfer_weights = np.maximum(
-                1,
-                np.rint(transfer_weights.astype(np.float64) * walk_time_multiplier).astype(np.int64),
-            )
-
         if transfer_offsets.shape[0] != len(stop_ids) + 1:
             logger.warning("Ignoring transfer cache due to invalid offsets shape path=%s", path)
             return None
@@ -800,13 +793,6 @@ def _ensure_transfer_graph(network: TransitNetwork) -> TransitNetwork:
         network.stop_lats,
         network.stop_lons,
     )
-
-    walk_time_multiplier = _parse_positive_float_env("WALK_TIME_MULTIPLIER", DEFAULT_WALK_TIME_MULTIPLIER)
-    if abs(walk_time_multiplier - 1.0) > 1e-9 and transfer_weights.size > 0:
-        transfer_weights = np.maximum(
-            1,
-            np.rint(transfer_weights.astype(np.float64) * walk_time_multiplier).astype(np.int64),
-        )
 
     network.transfer_offsets = transfer_offsets
     network.transfer_neighbors = transfer_neighbors

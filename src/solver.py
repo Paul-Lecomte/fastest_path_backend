@@ -68,11 +68,9 @@ def run_raptor_with_stats(
     default_trip_factor = np.int64(1000)
     walk_factor_num = np.int64(3)
     walk_factor_den = np.int64(2)
-    # Keep walk-feasibility caps aligned with inflated transfer edge weights.
-    # Base policy (180s / 600s) is scaled by the same realism multiplier used in loader/http.
-    walk_time_multiplier = np.int64(15)
-    max_transfer_walk_seconds = np.int64(180) * walk_time_multiplier
-    max_total_walk_seconds = np.int64(600) * walk_time_multiplier
+    # Transfer weights are encoded directly in seconds.
+    max_transfer_walk_seconds = np.int64(180)
+    max_total_walk_seconds = np.int64(600)
     transfer_penalty_cost = np.int64(max(0, int(transfer_penalty_seconds))) * cost_scale
     transfer_walk_penalty_cost = transfer_penalty_cost
     transfer_board_buffer_seconds = np.int64(min(10, max(0, int(transfer_penalty_seconds)) // 60))
