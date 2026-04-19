@@ -55,7 +55,7 @@ def main() -> None:
     parser.add_argument("--max-neighbors", type=int, default=4, help="Max nearby stops per source")
     parser.add_argument("--walk-speed-mps", type=float, default=1.4, help="Walking speed (m/s)")
     parser.add_argument("--min-seconds", type=int, default=30, help="Minimum transfer time (seconds)")
-    parser.add_argument("--walk-time-multiplier", type=float, default=15.0, help="Multiplier for realistic walk times")
+    parser.add_argument("--walk-time-multiplier", type=float, default=1.0, help="Multiplier applied to geometric walk-time estimate")
     args = parser.parse_args()
 
     print("Loading transit network...")
